@@ -41,6 +41,11 @@ WORKOS_AUTH = "https://api.workos.com/user_management/authenticate"
 CLINE_REGISTER = "https://api.cline.bot/api/v1/auth/register"
 CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR"
 
+# Ensure emoji output works even when stdout is piped/redirected (e.g. Windows cp1252)
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure") and (_stream.encoding or "").lower() not in ("utf-8", "utf8"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def in_ci():
     return os.environ.get("GITHUB_ACTIONS") == "true"
