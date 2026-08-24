@@ -33,6 +33,9 @@ let currentAccount = null;     // account currently in use (safe under the seria
 // No artificial cline/ prefix is added; Telegram displays these full IDs,
 // avoiding confusion when different providers' model names get truncated.
 const MODELS = [
+  // Stealth preview model listed on Cline's free tier ("Ox Alpha"; early free access).
+  // Same ID upstream and downstream; rides the free channel at $0 during the preview window.
+  { id: "stealth/ox-alpha", upstream: "stealth/ox-alpha", provider: "stealth", cost: "free" },
   { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
   { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
   { id: "cline-pass/glm-5.2", upstream: "cline-pass/glm-5.2", provider: "zai", cost: "pass" },
@@ -42,7 +45,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.1.6";
+const VERSION = "1.1.7";
 
 export default {
   async fetch(request, env) {
@@ -379,10 +382,10 @@ async function handleChat(request, env) {
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
     messages: params.messages || [],
   };
-  // ⚠️ Free DeepSeek channel: non-streaming requests get rate-limited upstream (500 empty response content)
+  // ⚠️ Free channels (deepseek, stealth): non-streaming requests get rate-limited upstream (500 empty response content)
   //    while streaming works. So when the client asks for non-streaming, force stream toward
   //    upstream and aggregate the chunks back into a non-streaming response.
-  const forceStream = !isStream && upstreamModel.startsWith("deepseek/");
+  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/"));
   if (isStream || forceStream) body.stream = true;
   // Pass through optional parameters
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
@@ -581,8 +584,8 @@ async function handleAnthropic(request, env) {
     reasoning_effort: "high",
     messages,
   };
-  // ⚠️ Free DeepSeek channel: non-streaming is rate-limited upstream, force stream and aggregate
-  const forceStream = !isStream && upstreamModel.startsWith("deepseek/");
+  // ⚠️ Free channels (deepseek, stealth): non-streaming is rate-limited upstream, force stream and aggregate
+  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/"));
   if (isStream || forceStream) body.stream = true;
   if (req.temperature !== undefined) body.temperature = req.temperature;
   if (req.top_p !== undefined) body.top_p = req.top_p;

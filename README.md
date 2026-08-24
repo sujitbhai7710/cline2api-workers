@@ -160,7 +160,7 @@ When hooking this Worker into **AgentScope (QwenPaw / qwenpaw.agentscope.io)** a
 - **API Base / Base URL**: `https://cline2api.<your-subdomain>.workers.dev/v1`
   (some platforms want the field without `/v1`: `https://cline2api.<your-subdomain>.workers.dev`; try whichever the platform suggests)
 - **API Key**: the `API_KEY` value you set (e.g. `sk-cline-xxx`)
-- **Model**: `deepseek/deepseek-v4-flash` (default), `poolside/laguna-s-2.1:free`, or `zai/glm-5.2` (paid, ~$0.0008/request).
+- **Model**: `deepseek/deepseek-v4-flash` (default), `stealth/ox-alpha`, `poolside/laguna-s-2.1:free`, or `zai/glm-5.2` (paid, ~$0.0008/request).
   `depth/deepseek-v4-flash` is a spelling alias of `deepseek/deepseek-v4-flash` — same free model, any prefix works.
 
 > If AgentScope uses the standard OpenAI SDK, just set the base_url + api_key above.
@@ -207,11 +207,18 @@ Compatible with OpenAI clients (`/v1/chat/completions`) and Anthropic clients (`
 |---|---|
 | `deepseek/deepseek-v4-flash` | ✅ **Free, working** (default; requires full Cline client headers + forced streaming, fixed) |
 | `depth/deepseek-v4-flash` | ✅ **Free, working** (spelling alias of `deepseek/deepseek-v4-flash`, same model, any prefix works) |
+| `stealth/ox-alpha` | ✅ **Free, working** ("Ox Alpha" stealth preview model on Cline's free tier; 1M context, limited-time early free access — added 2026-08-25) |
 | `poolside/laguna-s-2.1:free` | ✅ **Free, working** |
 | `zai/glm-5.2` | ✅ **Working (paid)**, uses Cline system credentials, ~$0.0008/request |
 | `cline-free/glm-5.2` | ❌ **Delisted** (upstream 404 `model not found`, tested 2026-08-06) |
 | `cline-pass/*` | ❌ 403, requires a paid cline-pass subscription |
 
+> ⚠️ **2026-08-25 update**:
+> - **`stealth/ox-alpha` added** ("Ox Alpha"): an anonymous stealth preview model that Cline now lists in its official
+>   free tier (`stealth/ox-alpha`, described as "High-quality coding model with early free access"). It is exposed by this worker as-is,
+>   treated like the other free channels (non-streaming client requests are served by forcing upstream streaming and aggregating).
+>   Note: it is a limited-time free preview — availability and pricing may change upstream.
+>
 > ⚠️ **2026-08-06 update**:
 > - **`cline-free/glm-5.2` delisted upstream**: that free model name now returns 404 `model not found` from Cline upstream (not a header issue —
 >   the same Cline fingerprint headers used for deepseek still return 200). The paid channel for the same model, `zai/glm-5.2`, works (~$0.0008/request,
