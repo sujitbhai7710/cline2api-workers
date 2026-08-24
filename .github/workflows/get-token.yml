@@ -1,16 +1,16 @@
-name: 获取 Cline refreshToken
+name: Get Cline refreshToken
 
-# 只允许手动触发（Actions 页面 → Run workflow）
+# Manual trigger only (Actions page → Run workflow)
 on:
   workflow_dispatch:
     inputs:
       poll_timeout:
-        description: "授权等待秒数（默认 300，可在手机上慢慢操作）"
+        description: "Authorization wait seconds (default 300, so you can take your time on a phone)"
         required: false
         default: "300"
         type: string
       use_warp:
-        description: "是否启用 WARP 网络（绕注册风控；若失效可关掉重试）"
+        description: "Enable WARP network (bypasses registration risk control; disable and retry if it stops working)"
         required: false
         default: true
         type: boolean
@@ -23,27 +23,27 @@ jobs:
   oauth:
     runs-on: ubuntu-latest
     steps:
-      # 强制校验 TG 变量：不配置则不运行
-      - name: 校验 TG 变量（未配置则不运行）
+      # Enforce Telegram variable check: do not run without them
+      - name: Verify Telegram variables (skip run if unconfigured)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -u
           if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "❌ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，工作流不运行。"
-            echo "   请在仓库 Settings → Secrets and variables → Actions 配置这两个 secret："
-            echo "     - TG_BOT_TOKEN：Telegram Bot 的 token"
-            echo "     - TG_CHAT_ID  ：接收消息的 chat_id"
+            echo "❌ TG_BOT_TOKEN or TG_CHAT_ID is not configured; the workflow will not run."
+            echo "   Configure these two secrets in repo Settings → Secrets and variables → Actions:"
+            echo "     - TG_BOT_TOKEN: your Telegram Bot token"
+            echo "     - TG_CHAT_ID  : the chat_id receiving messages"
             exit 1
           fi
-          echo "✅ TG 变量已配置，继续。"
+          echo "✅ Telegram variables configured, continuing."
 
-      - name: 检出代码
+      - name: Check out code
         uses: actions/checkout@v4
 
       # =========================
-      # 4️⃣ WARP 网络（换出口 IP，绕注册短信风控）
+      # 4️⃣ WARP network (changes the egress IP, bypasses registration risk control)
       # =========================
       - name: Enable WARP
         if: inputs.use_warp == 'true'
@@ -53,7 +53,7 @@ jobs:
           mode: client
 
       # =========================
-      # 5️⃣ 检查 IP（确认 WARP 生效）
+      # 5️⃣ Check IP (confirm WARP is active)
       # =========================
       - name: Check IP
         if: inputs.use_warp == 'true'
@@ -63,14 +63,14 @@ jobs:
           echo ""
           curl -s https://ipinfo.io
 
-      - name: 运行 OAuth 获取脚本（授权链接与 token 推送 TG）
+      - name: Run OAuth script (authorization link and token pushed to Telegram)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           OAUTH_POLL_TIMEOUT: ${{ inputs.poll_timeout }}
         run: python3 cline_oauth.py
 
-      # 清理旧 run jobs：只保留最新 1 条运行记录
+      # Clean up old runs: keep only the latest run record
       - name: clear old run jobs
         if: always()
         env:

@@ -1,19 +1,19 @@
 /**
- * cline2api - Cloudflare Workers 版
+ * cline2api - Cloudflare Workers edition
  *
- * 逆向自 https://github.com/luawei1/cline2api (Go 版反向代理)
+ * Reverse-engineered from https://github.com/luawei1/cline2api (a Go reverse proxy)
  *
- * 核心逻辑：
- *  1. 每次请求用 refreshToken 换 accessToken（缓存到内存，过期自动刷新）
- *  2. 把 OpenAI / Anthropic 请求转发到 https://api.cline.bot/api/v1/chat/completions
- *  3. SSE 流式响应剥掉上游 {data:{...}} 包装，透传给客户端
+ * Core logic:
+ *  1. Exchange the refreshToken for an accessToken on every request (cached in memory, auto-refreshed when expired)
+ *  2. Forward OpenAI / Anthropic requests to https://api.cline.bot/api/v1/chat/completions
+ *  3. Strip the upstream {data:{...}} wrapper from SSE streaming responses before passing them through to the client
  *
- * 环境变量：
- *  - CLINE_REFRESH_TOKEN (必需)  Cline 账号的 refreshToken
- *  - API_KEY                (可选) 自定义访问 key；不设置则每次部署随机生成并打印到日志
+ * Environment variables:
+ *  - CLINE_REFRESH_TOKEN (required)   Cline account refreshToken
+ *  - API_KEY                (optional) Custom access key; if unset a random one is generated per deployment and printed to logs
  *
- * 用法（OpenAI 兼容）：
- *   curl https://你的worker/v1/chat/completions \
+ * Usage (OpenAI-compatible):
+ *   curl https://your-worker/v1/chat/completions \
  *     -H "Authorization: Bearer <API_KEY>" \
  *     -H "Content-Type: application/json" \
  *     -d '{"model":"cline/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
@@ -21,16 +21,17 @@
 
 const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 
-// 账号池：支持多个 Cline 账号，每个账号独立缓存 accessToken
-// CLINE_REFRESH_TOKEN 环境变量可包含多行，每行一个 refreshToken，
-// 额度用尽(空响应)时自动轮换下一个账号。
-// 结构：{ refreshToken, accessToken, expiry, cooldownUntil }
+// Account pool: supports multiple Cline accounts, each with its own accessToken cache.
+// The CLINE_REFRESH_TOKEN env var can contain multiple lines, one refreshToken per line;
+// accounts rotate automatically when quota runs out (empty response).
+// Shape: { refreshToken, accessToken, expiry, cooldownUntil }
 let accounts = [];
-let accountIndex = 0;          // round-robin 游标
-let currentAccount = null;     // 当前正在使用的账号（串行队列下安全）
+let accountIndex = 0;          // round-robin cursor
+let currentAccount = null;     // account currently in use (safe under the serial queue)
 
-// 模型列表：原样使用 Cline /v1/models 返回的完整模型 ID。
-// 不人为添加 cline/ 前缀；Telegram 会完整显示这些 ID，避免不同供应商模型名被截断后混淆。
+// Model list: uses the full model IDs returned by Cline's /v1/models as-is.
+// No artificial cline/ prefix is added; Telegram displays these full IDs,
+// avoiding confusion when different providers' model names get truncated.
 const MODELS = [
   { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
   { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
@@ -39,7 +40,7 @@ const MODELS = [
   { id: "cline-pass/qwen3.7-max", upstream: "cline-pass/qwen3.7-max", provider: "qwen", cost: "pass" },
 ];
 
-// 默认模型：Cline 免费 DeepSeek 通道（完整头 + 强制 stream 已修复）
+// Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const VERSION = "1.1.6";
 
@@ -47,7 +48,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS 预检
+    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -55,7 +56,7 @@ export default {
       });
     }
 
-    // 健康诊断端点（无需鉴权，用于排查环境变量是否生效）
+    // Health/diagnostic endpoint (no auth; used to check whether env vars are configured)
     if (request.method === "GET" && url.pathname === "/v1/health") {
       const poolN = parseAccounts(env).length;
       return jsonResponse({
@@ -67,9 +68,9 @@ export default {
       }, 200);
     }
 
-    // 全局鉴权：所有端点都需要 API Key（除 OPTIONS 预检）
-    // 若未配置 API_KEY，则使用内置默认 key "cline2api-default-key"
-    // (可选) 设 API_KEY="" 表示完全关闭鉴权
+    // Global auth: every endpoint requires an API key (except OPTIONS preflight).
+    // If API_KEY is not configured, the built-in default key "cline2api-default-key" is used.
+    // (Optional) Setting API_KEY="" disables authentication entirely.
     // GET /v1/models
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
       const key = getApiKey(request, env);
@@ -79,7 +80,7 @@ export default {
       return handleModels();
     }
 
-    // POST 聊天端点
+    // POST chat endpoints
     if (request.method === "POST") {
       if (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") {
         return handleChat(request, env);
@@ -94,16 +95,16 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// Token 管理
+// Token management
 // ---------------------------------------------------------------------------
 
-// 从环境变量解析账号池：CLINE_REFRESH_TOKEN 每行一个
+// Parse the account pool from the environment: one token per line in CLINE_REFRESH_TOKEN
 function parseAccounts(env) {
   const raw = env.CLINE_REFRESH_TOKEN || "";
   const tokens = raw.split("\n").map((s) => s.trim()).filter((s) => s.length > 8);
   if (tokens.length === 0) return [];
 
-  // 若 token 列表变化（增删账号），重建账号池
+  // If the token list changed (accounts added/removed), rebuild the pool
   const changed =
     accounts.length !== tokens.length ||
     accounts.some((a, i) => a.refreshToken !== tokens[i]);
@@ -118,10 +119,10 @@ function parseAccounts(env) {
   return accounts;
 }
 
-// 取得当前账号的 accessToken（独立缓存，失效/冷却则刷新）
+// Get the current account's accessToken (cached independently; refreshed when expired or cooling)
 async function getAccountToken(account) {
   const now = Date.now();
-  // 冷却期内不可用
+  // Not usable while cooling down
   if (account.cooldownUntil > now) {
     throw new Error("account_cooldown");
   }
@@ -137,7 +138,7 @@ async function getAccountToken(account) {
     }),
   });
   if (!resp.ok) {
-    // 刷新失败：冷却 60s，交给上层切号
+    // Refresh failed: cool down for 60s, let the caller switch accounts
     account.cooldownUntil = now + 60 * 1000;
     throw new Error("refresh_failed");
   }
@@ -148,11 +149,11 @@ async function getAccountToken(account) {
     throw new Error("refresh_no_token");
   }
   account.accessToken = accessToken;
-  // Cline 会在刷新时轮换 refreshToken；必须保存新 token，避免下一次刷新 invalid_grant。
+  // Cline rotates the refreshToken on refresh; the new token must be saved to avoid invalid_grant on the next refresh.
   if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {
     account.refreshToken = data.data.refreshToken.trim();
   }
-  // 过期时间：优先服务端，兜底 10 分钟，留 60s 余量
+  // Expiry: prefer the server-provided value, fall back to 10 minutes minus a 60s safety margin
   const expiresAt = data?.data?.expiresAt;
   let expiry = now + 10 * 60 * 1000;
   if (typeof expiresAt === "number") {
@@ -165,7 +166,7 @@ async function getAccountToken(account) {
   return accessToken;
 }
 
-// 轮询选择一个可用账号，返回该账号对象（并设置 currentAccount）
+// Pick an available account round-robin, return the account object (and set currentAccount)
 function pickAccount(pool) {
   for (let k = 0; k < pool.length; k++) {
     const acc = pool[accountIndex % pool.length];
@@ -175,39 +176,39 @@ function pickAccount(pool) {
       return acc;
     }
   }
-  return null; // 全部冷却中
+  return null; // all accounts cooling down
 }
 
 async function getAccessToken(env) {
   const pool = parseAccounts(env);
   if (pool.length === 0) {
-    throw new Error("缺少 CLINE_REFRESH_TOKEN 环境变量");
+    throw new Error("Missing CLINE_REFRESH_TOKEN environment variable");
   }
-  // 最多尝试 pool.length 个账号（跳过冷却/刷新失败的）
+  // Try at most pool.length accounts (skipping cooling/refresh-failed ones)
   for (let attempt = 0; attempt < pool.length; attempt++) {
-    const acc = pool[attempt % pool.length]; // 逐个尝试
+    const acc = pool[attempt % pool.length]; // try one by one
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
       return await getAccountToken(acc);
     } catch (e) {
       if (e.message === "account_cooldown") continue;
-      continue; // 刷新失败也切下个号
+      continue; // refresh failed too: move to the next account
     }
   }
-  // 全部失败，清冷却重试一次最早的
+  // Everything failed: clear cooldown and retry the first account once
   const acc = pool[0];
   currentAccount = acc;
   acc.cooldownUntil = 0;
   try {
     return await getAccountToken(acc);
   } catch (e) {
-    throw new Error("所有账号刷新 token 均失败");
+    throw new Error("All accounts failed to refresh tokens");
   }
 }
 
-// Cline 客户端指纹请求头（官方靠这些头识别"是不是 Cline 客户端"）
-// 缺少会被 403: "deepseek/deepseek-v4-flash is only available via Cline product surfaces"
+// Cline client fingerprint headers (the official side uses these to identify "is this a real Cline client")
+// Missing headers trigger 403: "deepseek/deepseek-v4-flash is only available via Cline product surfaces"
 function clineHeaders(sessionId) {
   return {
     Authorization: "Bearer workos:" + currentToken,
@@ -225,7 +226,7 @@ function clineHeaders(sessionId) {
   };
 }
 
-// 当前账号的 accessToken（供 clineHeaders 使用）
+// The current account's accessToken (used by clineHeaders)
 let currentToken = "";
 
 async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
@@ -240,7 +241,7 @@ async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
     body: JSON.stringify(bodyObj),
   });
   if (resp.status === 401 && !retried) {
-    // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
+    // Token invalid: mark the current account as cooling down and force a retry (another account / refresh will be used)
     if (currentAccount) {
       currentAccount.cooldownUntil = Date.now() + 60 * 1000;
       currentAccount.accessToken = null;
@@ -252,16 +253,17 @@ async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
 }
 
 // ---------------------------------------------------------------------------
-// 并发限流队列：上游免费通道并发超过 1 就返回空响应，这里强制串行 + 间隔
+// Concurrency queue: the upstream free channel returns empty responses when
+// concurrency exceeds 1, so requests are forced serial with a minimum gap
 // ---------------------------------------------------------------------------
 
-let queueTail = Promise.resolve(); // 全局串行队列尾巴
-const MIN_GAP_MS = 800;            // 两次上游请求最小间隔
+let queueTail = Promise.resolve(); // tail of the global serial queue
+const MIN_GAP_MS = 800;            // minimum interval between two upstream requests
 
 function enqueue(fn) {
-  // 前一个任务结束后，等待间隔，再执行 fn
+  // After the previous task finishes, wait for the gap, then run fn
   const run = queueTail.then(() => sleep(MIN_GAP_MS)).then(fn);
-  // 不管成功失败都继续链，避免队列断裂
+  // Keep the chain going on success or failure, so the queue never breaks
   queueTail = run.catch(() => {});
   return run;
 }
@@ -270,8 +272,8 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// 解析上游 429/限流响应里的等待时间，返回毫秒
-// 支持格式: "Try again in 2h 51m" / "Try again in 30m" / "Try again in 1h" / "Try again in 15s"
+// Parse the wait time from upstream 429/rate-limit responses, returns milliseconds
+// Supported formats: "Try again in 2h 51m" / "Try again in 30m" / "Try again in 1h" / "Try again in 15s"
 function parseCooldown(body, status) {
   const m = (body || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
   if (m) {
@@ -279,35 +281,35 @@ function parseCooldown(body, status) {
     const min = parseInt(m[2] || 0, 10);
     const s = parseInt(m[3] || 0, 10);
     const ms = (h * 3600 + min * 60 + s) * 1000;
-    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000); // 上限 6 小时
+    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000); // cap at 6 hours
   }
-  // 429 默认 5 分钟；空响应默认 60 秒
+  // 429 defaults to 5 minutes; empty response defaults to 60 seconds
   if (status === 429) return 5 * 60 * 1000;
   return 60 * 1000;
 }
 
-// 带重试的 clineFetch：429限流/空响应/5xx 自动切换账号 + 指数退避重试
-// 一个号额度用完或限流(429 Daily free limit reached)时：
-//   - 冷却该账号（冷却时长按上游提示，如 2h51m）
-//   - 自动轮换到下一个号重试同一请求
-// 所有账号都冷却时，直接返回原始响应（不空转）
+// clineFetch with retries: auto-switch accounts + exponential backoff on 429 rate limits / empty responses / 5xx.
+// When an account's quota is exhausted or rate-limited (429 Daily free limit reached):
+//   - Cool that account down (duration parsed from the upstream hint, e.g. 2h51m)
+//   - Automatically rotate to the next account and retry the same request
+// When all accounts are cooling down, return the original response as-is (no spinning)
 async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = false, maxRetries = 4) {
   let lastResp = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    // 通过队列串行执行，避免并发空响应
+    // Run through the queue serially to avoid concurrent empty responses
     const resp = await enqueue(() => clineFetch(env, path, bodyObj, sessionId));
     lastResp = resp;
 
-    // 统一读 body（clone 不消耗流）
+    // Read the body uniformly (clone doesn't consume the stream)
     let bodyText = "";
     try {
       bodyText = await resp.clone().text();
     } catch (e) {}
 
-    // 判定"额度/限流"信号（需要切号）：
-    // 1. 429（Daily free limit reached / rate limit）
-    // 2. 5xx 且含 empty response content
-    // 3. 200 非流式但 body 是空响应包装
+    // Detect "quota/rate limit" signals (need to switch accounts):
+    // 1. 429 (Daily free limit reached / rate limit)
+    // 2. 5xx containing "empty response content"
+    // 3. 200 non-streaming but the body is an empty-response wrapper
     const isLimitHit =
       resp.status === 429 ||
       (resp.status >= 500 && bodyText.includes("empty response content")) ||
@@ -319,38 +321,38 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         currentAccount.cooldownUntil = Date.now() + cooldownMs;
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
-        console.log(`[account-switch] 账号额度/限流，冷却 ${Math.round(cooldownMs / 1000)}s，切换到下一个`);
+        console.log(`[account-switch] account quota/rate-limited, cooling down ${Math.round(cooldownMs / 1000)}s, switching to the next one`);
       }
-      // 还有可用账号 → 短退避后重试（会切到下一个号）
+      // Other accounts still available → short backoff then retry (switches to the next account)
       const pool = parseAccounts(env);
       const hasOther = pool.some((a) => !a.cooldownUntil || a.cooldownUntil <= Date.now());
       if (!hasOther) {
-        console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
-        return resp; // 不空转，把 429/错误返回给客户端
+        console.log(`[retry] all accounts cooling down, returning upstream response as-is`);
+        return resp; // no spinning; pass the 429/error back to the client
       }
       await sleep(500 + Math.floor(Math.random() * 500));
       continue;
     }
 
-    // 正常响应（200）
+    // Normal response (200)
     if (resp.ok) {
-      if (isStream) return resp; // 流式：直接转发
-      return resp;               // 非流式：body 已确认非空响应
+      if (isStream) return resp; // streaming: forward directly
+      return resp;               // non-streaming: body confirmed not an empty response
     }
 
-    // 其他错误（403/400/401 等）不重试，直接返回
+    // Other errors (403/400/401 etc.) are not retried, returned as-is
     return resp;
   }
-  // 重试次数用完，返回最后一次响应
+  // Retries exhausted: return the last response
   return lastResp;
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI 协议
+// OpenAI protocol
 // ---------------------------------------------------------------------------
 
 async function handleChat(request, env) {
-  // API Key 鉴权
+  // API key authentication
   const key = getApiKey(request, env);
   if (!key) {
     return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
@@ -369,7 +371,7 @@ async function handleChat(request, env) {
   const modelConfig = MODELS.find((m) => m.id === model);
   const upstreamModel = modelConfig?.upstream || model;
 
-  // 构造上游 body（外部模型 ID 与 Cline 上游模型 ID 分离）
+  // Build the upstream body (external model IDs kept separate from Cline upstream IDs)
   const body = {
     model: upstreamModel,
     max_tokens: params.max_tokens || params.max_completion_tokens || 128000,
@@ -377,11 +379,12 @@ async function handleChat(request, env) {
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
     messages: params.messages || [],
   };
-  // ⚠️ 免费 DeepSeek 通道：非流式请求被上游限流(500 empty response content)，
-  //    流式请求正常。所以客户端要非流式时，强制上游走 stream，再聚合返回。
+  // ⚠️ Free DeepSeek channel: non-streaming requests get rate-limited upstream (500 empty response content)
+  //    while streaming works. So when the client asks for non-streaming, force stream toward
+  //    upstream and aggregate the chunks back into a non-streaming response.
   const forceStream = !isStream && upstreamModel.startsWith("deepseek/");
   if (isStream || forceStream) body.stream = true;
-  // 透传可选参数
+  // Pass through optional parameters
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
     if (params[k] !== undefined) body[k] = params[k];
   }
@@ -393,19 +396,19 @@ async function handleChat(request, env) {
       return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
     }
     if (isStream) {
-      // 客户端要流式：直接透传 SSE
+      // Client wants streaming: pass the SSE through directly
       return streamResponse(resp, model);
     }
     if (forceStream) {
-      // 客户端要非流式 + 上游是流式：聚合 chunks 再返回
-      // ⚠️ 免费通道(deepseek/cline-free)会概率性返回「HTTP200但content全程为空」的流
-      //    （100个chunk全是reasoning，无正式content）。这里做内容检测：空则切号重试。
+      // Client wants non-streaming + upstream is streaming: aggregate chunks and return
+      // ⚠️ The free channel (deepseek/cline-free) can occasionally return an "HTTP 200 but content empty all along"
+      //    stream (100 chunks of pure reasoning, no real content). Content is checked here: retry on another account if empty.
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
       retried.data.model = model;
       return jsonResponse(retried.data, 200);
     }
-    // 非流式 + 非 deepseek：原逻辑
+    // Non-streaming + non-deepseek: original logic
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     normalized.model = model;
@@ -415,17 +418,17 @@ async function handleChat(request, env) {
   }
 }
 
-// 把上游 SSE 流聚合成 OpenAI 非流式响应对象
-// 用于"客户端要非流式，但上游只能流式"的情况（deepseek 免费通道）
-// 额外处理：上游 200 但 content 全空（只有 reasoning）→ 视为坏响应，切号重试
-// 由调用方传入"已获取的上游响应"，这里负责聚合 + content 检测 + 空则重试。
+// Aggregate the upstream SSE stream into an OpenAI non-streaming response object.
+// Used when "the client wants non-streaming, but the upstream only supports streaming" (deepseek free channel).
+// Extra handling: upstream 200 with completely empty content (reasoning only) → treated as a bad response, switch account and retry.
+// The caller passes in the already-obtained upstream response; this function handles aggregation + content checking + retry on empty.
 async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstResp) {
-  const maxAttempts = 3; // 最多试 3 次（覆盖多账号切换）
+  const maxAttempts = 3; // at most 3 attempts (covers multi-account switching)
   let lastData = null;
   let resp = firstResp;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (!resp) {
-      // 需要重新发起上游请求（空响应重试时）
+      // Need to re-issue the upstream request (retrying after an empty response)
       resp = await clineFetchWithRetry(env, path, bodyObj, sessionId, true);
     }
     if (!resp.ok) {
@@ -447,30 +450,30 @@ async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstRes
     const msg = normalized?.choices?.[0]?.message || {};
     const content = (msg.content || "").trim();
     const reasoning = (msg.reasoning || "").trim();
-    // ⚠️ reasoning 兜底标记：content 为空时 streamToNonStream 会把 reasoning 拼进 content，
-    //    这里要识别出来，不能把它当成"好响应"。
+    // ⚠️ Reasoning fallback marker: when content is empty, streamToNonStream folds reasoning into content,
+    //    which must be recognized here — it must not be treated as a "good response".
     const isReasoningFallback = msg.reasoning_used_as_content === true;
     if (content && !isReasoningFallback) {
-      return { data: normalized }; // 有正式 content → 好响应
+      return { data: normalized }; // real content present → good response
     }
-    // content 为空（或只有兜底 reasoning）：如果只有 reasoning，标记当前账号冷却并重试
+    // Empty content (or reasoning-only fallback): if only reasoning was returned, cool this account down and retry
     if (reasoning || isReasoningFallback) {
       if (currentAccount) {
-        currentAccount.cooldownUntil = Date.now() + 30 * 1000; // 短冷却 30s
+        currentAccount.cooldownUntil = Date.now() + 30 * 1000; // short 30s cooldown
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
-        console.log(`[empty-content] 账号 ${attempt} 返回空 content，冷却 30s，重试第 ${attempt + 2} 次`);
+        console.log(`[empty-content] account ${attempt} returned empty content, cooling down 30s, retry #${attempt + 2}`);
       }
       await sleep(300 + Math.floor(Math.random() * 300));
-      resp = null; // 下次循环重新请求（切到下一个号）
+      resp = null; // re-request on the next loop iteration (switches to the next account)
       continue;
     }
-    // 完全空（连 reasoning 都没有）→ 也重试
-    console.log(`[empty-response] 账号 ${attempt} 完全空响应，重试第 ${attempt + 2} 次`);
+    // Completely empty (not even reasoning) → retry too
+    console.log(`[empty-response] account ${attempt} returned a fully empty response, retry #${attempt + 2}`);
     await sleep(300 + Math.floor(Math.random() * 300));
     resp = null;
   }
-  // 重试用完仍空：返回最后一次（至少带 reasoning，让客户端看到点东西）
+  // Still empty after exhausting retries: return the last result (at least it carries reasoning, so the client sees something)
   return { data: lastData };
 }
 
@@ -514,9 +517,9 @@ async function streamToNonStream(upstream) {
 
   const msg = { role: "assistant", content };
   if (reasoning) msg.reasoning = reasoning;
-  // ⚠️ 兜底：免费通道偶尔整个流只有 reasoning 没有 content（HTTP 200 但空）。
-  //    聚合后发现 content 仍为空且 reasoning 非空时，把 reasoning 拼进 content，
-  //    保证客户端（qwenpaw 等）至少能收到可见内容，不会"静默不回复"。
+  // ⚠️ Fallback: the free channel occasionally streams reasoning only with no content at all (HTTP 200 but empty).
+  //    After aggregation, if content is still empty and reasoning is not, fold reasoning into content so
+  //    clients (qwenpaw etc.) receive something visible instead of "silently never replying".
   if (!content && reasoning) {
     msg.content = reasoning;
     msg.reasoning_used_as_content = true;
@@ -538,7 +541,7 @@ async function streamToNonStream(upstream) {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic Messages API → 转 OpenAI 格式再转发
+// Anthropic Messages API → converted to OpenAI format then forwarded
 // ---------------------------------------------------------------------------
 
 async function handleAnthropic(request, env) {
@@ -560,7 +563,7 @@ async function handleAnthropic(request, env) {
   const modelConfig = MODELS.find((m) => m.id === requestedModel);
   const upstreamModel = modelConfig?.upstream || requestedModel;
 
-  // Anthropic → OpenAI 消息转换
+  // Anthropic → OpenAI message conversion
   const messages = [];
   if (req.system) {
     const sysContent = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
@@ -578,7 +581,7 @@ async function handleAnthropic(request, env) {
     reasoning_effort: "high",
     messages,
   };
-  // ⚠️ 免费 DeepSeek 通道：非流式被上游限流，强制上游 stream 再聚合
+  // ⚠️ Free DeepSeek channel: non-streaming is rate-limited upstream, force stream and aggregate
   const forceStream = !isStream && upstreamModel.startsWith("deepseek/");
   if (isStream || forceStream) body.stream = true;
   if (req.temperature !== undefined) body.temperature = req.temperature;
@@ -597,12 +600,12 @@ async function handleAnthropic(request, env) {
       return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
     }
     if (isStream) {
-      // 上游是 OpenAI SSE，转成 Anthropic SSE 格式
+      // Upstream is OpenAI SSE; convert to Anthropic SSE format
       return streamResponseAnthropic(resp);
     }
     if (forceStream) {
-      // 客户端要非流式 + 上游是流式：聚合后再转 Anthropic
-      // ⚠️ 同样做 content 检测：免费通道会概率性返回"200但content全空"的流，空则切号重试
+      // Client wants non-streaming + upstream is streaming: aggregate then convert to Anthropic
+      // ⚠️ Same content check applies: the free channel occasionally returns a "200 but content empty" stream; retry on another account if empty
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
       return jsonResponse(openAItoAnthropic(retried.data), 200);
@@ -617,10 +620,10 @@ async function handleAnthropic(request, env) {
 }
 
 // ---------------------------------------------------------------------------
-// 响应处理
+// Response handling
 // ---------------------------------------------------------------------------
 
-// 剥掉上游 {data:{...}} 包装（上游有时包一层 data）
+// Strip the upstream {data:{...}} wrapper (the upstream sometimes wraps in a data layer)
 function unwrapData(obj) {
   if (obj && obj.data && typeof obj.data === "object") {
     const d = obj.data;
@@ -629,7 +632,7 @@ function unwrapData(obj) {
   return obj;
 }
 
-// OpenAI SSE 流式透传（剥 data 包装）
+// OpenAI SSE streaming passthrough (strips the data wrapper)
 async function streamResponse(upstream, externalModel) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
@@ -644,7 +647,7 @@ async function streamResponse(upstream, externalModel) {
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
-        // 按行处理
+        // Process line by line
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, idx);
@@ -686,7 +689,7 @@ async function streamResponse(upstream, externalModel) {
   });
 }
 
-// Anthropic SSE：把上游 OpenAI chunk 转成 Anthropic 格式
+// Anthropic SSE: convert upstream OpenAI chunks to Anthropic format
 async function streamResponseAnthropic(upstream) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
@@ -726,7 +729,7 @@ async function streamResponseAnthropic(upstream) {
           }
         }
       }
-      // 结束事件
+      // End events
       await writer.write(encoder.encode("event: message_delta\ndata: " + JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } }) + "\n\n"));
       await writer.write(encoder.encode("event: message_stop\ndata: " + JSON.stringify({ type: "message_stop" }) + "\n\n"));
     } catch (e) {
@@ -746,7 +749,7 @@ async function streamResponseAnthropic(upstream) {
   });
 }
 
-// OpenAI 非流式 → Anthropic 非流式
+// OpenAI non-streaming → Anthropic non-streaming
 function openAItoAnthropic(openAI) {
   const choice = openAI?.choices?.[0];
   const content = choice?.message?.content || "";
@@ -765,7 +768,7 @@ function openAItoAnthropic(openAI) {
 }
 
 // ---------------------------------------------------------------------------
-// 辅助
+// Helpers
 // ---------------------------------------------------------------------------
 
 function handleModels() {
@@ -780,7 +783,7 @@ function handleModels() {
 
 function getApiKey(request, env) {
   const provided = env.API_KEY;
-  // 未配置 API_KEY → 使用内置默认 key
+  // API_KEY not configured → use the built-in default key
   const expected = provided !== undefined && provided !== null && provided !== "" ? provided : "cline2api-default-key";
 
   const auth = request.headers.get("Authorization") || "";

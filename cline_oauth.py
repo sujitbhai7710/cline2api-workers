@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""Cline 一键获取 refreshToken 脚本（WorkOS 设备授权码流程）。
+"""One-shot script to obtain a Cline refreshToken (WorkOS device authorization flow).
 
-用法：
+Usage:
   python3 cline_oauth.py
 
-流程（逆向自 cline2api/auth.go）：
-  1. POST api.workos.com/user_management/authorize/device → 拿授权链接
-  2. 打印链接/推送 TG，等待用户在浏览器授权（自动轮询 authenticate）
-  3. 授权成功 → 用 WorkOS token 调 api.cline.bot/api/v1/auth/register
-  4. 拿到 refreshToken → 填入 Cloudflare Worker 机密变量
+Flow (reverse-engineered from cline2api/auth.go):
+  1. POST api.workos.com/user_management/authorize/device → get the authorization link
+  2. Print the link / push it to Telegram, wait for the user to authorize in the browser (polls authenticate automatically)
+  3. On success → call api.cline.bot/api/v1/auth/register with the WorkOS token
+  4. Get the refreshToken → paste it into the Cloudflare Worker secret variable
 
-GitHub Actions 里的安全行为（重要）：
-  * 配置了 TG_BOT_TOKEN / TG_CHAT_ID 时，授权链接与 refreshToken 一律推送到
-    Telegram，**refreshToken 绝不打印到标准输出/日志**。
-  * 未配置 TG 时（本地手动跑），保持原样打印，方便直接查看。
+Security behavior inside GitHub Actions (important):
+  * When TG_BOT_TOKEN / TG_CHAT_ID are configured, both the authorization link and
+    the refreshToken are pushed to Telegram, and **the refreshToken is never printed
+    to stdout/logs**.
+  * Without Telegram configured (local manual run), it prints as before for easy viewing.
 
-环境变量：
-  TG_BOT_TOKEN         Telegram Bot Token（可选；与 TG_CHAT_ID 一起配置才推送）
-  TG_CHAT_ID           Telegram 接收 chat_id（可选）
-  OAUTH_POLL_TIMEOUT   授权等待秒数（可选，默认用 WorkOS 返回的 expires_in）
+Environment variables:
+  TG_BOT_TOKEN         Telegram Bot Token (optional; pushes only when set together with TG_CHAT_ID)
+  TG_CHAT_ID           Telegram receiving chat_id (optional)
+  OAUTH_POLL_TIMEOUT   Authorization wait seconds (optional; defaults to WorkOS's expires_in)
 
-依赖：仅 Python 3 标准库，无需 pip 安装任何东西。
+Dependencies: Python 3 standard library only, no pip installs needed.
 """
 import json
 import os
@@ -44,7 +45,7 @@ def tg_configured():
 
 
 def send_tg(text):
-    """推送文本到 Telegram，失败返回 False。"""
+    """Push text to Telegram; returns False on failure."""
     token = os.environ.get("TG_BOT_TOKEN")
     chat = os.environ.get("TG_CHAT_ID")
     if not token or not chat:
@@ -57,12 +58,12 @@ def send_tg(text):
         with urllib.request.urlopen(req, timeout=15) as r:
             return True
     except Exception as e:
-        print(f"   ⚠️ TG 发送失败: {e}")
+        print(f"   ⚠️ Telegram send failed: {e}")
         return False
 
 
 def mask_value(value):
-    """在 CI 中把敏感值加入 GitHub Actions 日志掩码（即使误打出也被打码）。"""
+    """Mask a sensitive value in GitHub Actions logs when running in CI (masked even if accidentally printed)."""
     if in_ci() and value:
         print(f"::add-mask::{value}")
 
@@ -83,7 +84,7 @@ def post_json(url, body):
 
 
 def device_auth():
-    """启动 WorkOS 设备授权，返回 (device_code, user_code, 授权链接, interval, expires_in)。"""
+    """Start WorkOS device authorization; returns (device_code, user_code, auth URL, interval, expires_in)."""
     resp = post_form(WORKOS_DEVICE, {"client_id": CLIENT_ID})
     url = resp.get("verification_uri_complete") or resp.get("verification_uri")
     return (resp["device_code"], resp["user_code"], url,
@@ -91,7 +92,7 @@ def device_auth():
 
 
 def poll_token(device_code, interval, expires_in):
-    """轮询 WorkOS 直到用户授权完成，返回 WorkOS access/refresh token。"""
+    """Poll WorkOS until the user finishes authorizing; returns the WorkOS access/refresh token."""
     interval = max(interval, 5)
     deadline = time.time() + expires_in
     while time.time() < deadline:
@@ -110,15 +111,15 @@ def poll_token(device_code, interval, expires_in):
             elif err not in ("authorization_pending",):
                 print(f"   [{err}] {a.get('error_description', '')}")
         except Exception as e:
-            print(f"   轮询出错: {e}")
-    raise TimeoutError("授权超时")
+            print(f"   polling error: {e}")
+    raise TimeoutError("authorization timed out")
 
 
 def main():
-    print("🚀 启动 Cline WorkOS 设备授权流程...\n")
+    print("🚀 Starting the Cline WorkOS device authorization flow...\n")
     device_code, user_code, auth_url, interval, expires_in = device_auth()
 
-    # 可选的轮询超时覆盖
+    # Optional polling timeout override
     env_timeout = os.environ.get("OAUTH_POLL_TIMEOUT")
     if env_timeout:
         try:
@@ -128,39 +129,39 @@ def main():
 
     use_tg = tg_configured()
     print("=" * 60)
-    print("1️⃣  在浏览器打开下面这个链接：")
+    print("1️⃣  Open this link in your browser:")
     print(f"    {auth_url}")
-    print("2️⃣  页面会要求输入设备码（可能已自动带好）：")
+    print("2️⃣  The page asks for a device code (usually pre-filled automatically):")
     print(f"    {user_code}")
-    print("3️⃣  用 Google / GitHub / 邮箱登录并授权")
+    print("3️⃣  Log in and authorize with Google / GitHub / email")
     print("=" * 60)
 
-    # 把授权链接推送到 TG，方便在手机上完成授权
+    # Push the authorization link to Telegram so authorization can be completed from a phone
     if use_tg:
         tg_msg = (
-            "🔑 *Cline 授权请求*\n\n"
-            "请在浏览器打开下面链接并完成授权（设备码已自动带好）：\n"
+            "🔑 *Cline authorization request*\n\n"
+            "Open the link below in your browser to authorize (device code pre-filled):\n"
             f"{auth_url}\n\n"
-            f"设备码：`{user_code}`\n"
-            f"脚本将自动轮询等待，最多 {expires_in} 秒。"
+            f"Device code: `{user_code}`\n"
+            f"The script polls automatically for up to {expires_in} seconds."
         )
         ok = send_tg(tg_msg)
         if not ok:
-            print("❌ 授权链接推送 TG 失败（请检查 TG_BOT_TOKEN / TG_CHAT_ID）")
+            print("❌ Failed to push the authorization link to Telegram (check TG_BOT_TOKEN / TG_CHAT_ID)")
             sys.exit(1)
-        print("📨 授权链接已推送到 Telegram。")
+        print("📨 Authorization link pushed to Telegram.")
     else:
-        print("ℹ️ 未配置 TG，授权链接仅在下方日志中显示。")
+        print("ℹ️ Telegram not configured; the authorization link is shown in the log below only.")
 
-    print(f"\n🔄 等待你授权（脚本自动轮询，最多 {expires_in} 秒）...")
+    print(f"\n🔄 Waiting for your authorization (polling automatically, up to {expires_in} seconds)...")
     try:
         workos = poll_token(device_code, interval, expires_in)
     except TimeoutError as e:
-        print(f"❌ {e}，请重新运行")
+        print(f"❌ {e}, please run again")
         sys.exit(1)
-    print("✅ WorkOS 授权成功！")
+    print("✅ WorkOS authorization succeeded!")
 
-    print("\n🔗 用 WorkOS token 在 Cline 注册...")
+    print("\n🔗 Registering with Cline using the WorkOS token...")
     cline = post_json(CLINE_REGISTER, {
         "accessToken": workos["access_token"],
         "refreshToken": workos["refresh_token"],
@@ -168,32 +169,33 @@ def main():
     data = cline.get("data", {})
     rt = data.get("refreshToken")
     if not rt:
-        print("❌ 注册失败，响应:", json.dumps(cline, ensure_ascii=False)[:500])
+        print("❌ Registration failed, response:", json.dumps(cline, ensure_ascii=False)[:500])
         sys.exit(1)
 
     email = (data.get("userInfo") or {}).get("email", "unknown")
-    # 邮箱同样视为敏感信息：打码，避免进入 Actions 日志
+    # The email is also treated as sensitive: mask it to keep it out of Actions logs
     mask_value(email)
     print("\n" + "=" * 60)
-    # 打码后显示，日志里是 ***
-    print(f"✅ 登录成功! 账号: {email}")
+    # Displayed after masking; logs show ***
+    print(f"✅ Login successful! Account: {email}")
 
-    # 关键安全点：CI + 配置了 TG 时，refreshToken 只推 TG，绝不打印到日志
+    # Key security point: in CI with Telegram configured, the refreshToken is only pushed
+    # to Telegram, never printed to logs
     if use_tg:
-        mask_value(rt)  # 兜底：即使万一打出也会被 Actions 掩码
+        mask_value(rt)  # safety net: masked even if accidentally printed
         ok = send_tg(
-            "🔑 *Cline refreshToken 已获取*\n\n"
-            f"账号：`{email}`\n\n"
-            "把下面这行填进 Cloudflare Worker 机密变量 `CLINE_REFRESH_TOKEN`（多账号则换行追加）：\n"
+            "🔑 *Cline refreshToken obtained*\n\n"
+            f"Account: `{email}`\n\n"
+            "Put the line below into the Cloudflare Worker secret `CLINE_REFRESH_TOKEN` (append on new lines for multiple accounts):\n"
             f"`{rt}`"
         )
         if not ok:
-            print("❌ refreshToken 推送 TG 失败！token 未打印到日志，请检查 TG 配置后重试。")
+            print("❌ Failed to push the refreshToken to Telegram! Token was NOT printed to logs; fix the Telegram config and retry.")
             sys.exit(1)
-        print("🔑 refreshToken 已通过 Telegram 私密发送（未写入日志）。")
+        print("🔑 refreshToken sent privately via Telegram (not written to logs).")
     else:
         mask_value(rt)
-        print("\n🔑 把下面这行填进 Cloudflare Worker 的机密变量 CLINE_REFRESH_TOKEN：")
+        print("\n🔑 Put the line below into the Cloudflare Worker secret CLINE_REFRESH_TOKEN:")
         print("    " + rt)
     print("=" * 60)
 

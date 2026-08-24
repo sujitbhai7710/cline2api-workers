@@ -1,265 +1,265 @@
-# Cline2API · Cloudflare Workers 版
+# Cline2API · Cloudflare Workers Edition
 
-把 Cline（https://cline.bot）的白嫖模型能力转成 OpenAI 兼容 API，部署在 Cloudflare Workers 上，免费、无服务器、无需本地运行。
+Turn Cline's (https://cline.bot) free model access into an OpenAI-compatible API, deployed on Cloudflare Workers — free, serverless, no local process required.
 
-> 逆向自 https://github.com/luawei1/cline2api
+> Reverse-engineered from https://github.com/luawei1/cline2api
 >
-> （Go 版代理），重写为纯 JS 的 Worker。
+> (a Go reverse proxy), rewritten as a pure-JS Worker.
 
 ---
 
-## 一、准备工作：获取 Cline 的 refreshToken ⭐（最关键）
+## 1. Preparation: Get a Cline refreshToken ⭐ (the most important step)
 
-要调用 Cline 的 API，需要一个 **refreshToken**（相当于 Cline 账号的"长期钥匙"，用它换每次请求用的 accessToken）。
+To call the Cline API you need a **refreshToken** (essentially your Cline account's "long-term key", used to obtain the accessToken for each request).
 
-本仓库提供 **两个获取方式**，任选其一：
+This repo provides **two ways to get it**, pick either one:
 
-### 方式①：命令行脚本（推荐，本仓库自带 `cline_oauth.py`）
+### Option 1: Command-line script (recommended, bundled in this repo as `cline_oauth.py`)
 
-脚本会启动 Cline 官方的 **WorkOS 设备授权码流程**，你在浏览器里登录一次即可，剩余全部自动：
+The script launches Cline's official **WorkOS device authorization flow**. You just log in once in the browser, everything else is automatic:
 
 ```bash
-# 1. 运行脚本，生成授权链接
+# 1. Run the script, it prints an authorization link
 python3 cline_oauth.py
 
-# 2. 脚本会打印一个链接，类似：
+# 2. The script prints a link like:
 #    https://authkit.cline.bot/device?user_code=XXXX-XXXX
-#    在浏览器打开，用 Google / GitHub / 邮箱登录授权
+#    Open it in your browser and authorize with Google / GitHub / email
 
-# 3. 授权完成后，脚本自动轮询并打印 refreshToken
+# 3. Once authorized, the script polls automatically and prints the refreshToken
 ```
 
-> 脚本内部做的（逆向自 auth.go）：
-> 1. `POST api.workos.com/.../authorize/device` → 拿 device_code + 授权链接
-> 2. 轮询 `api.workos.com/.../authenticate` → 授权成功后拿 WorkOS access_token
-> 3. `POST api.cline.bot/api/v1/auth/register` → 用 WorkOS token 换 Cline 的 refreshToken
+> What the script does internally (reverse-engineered from auth.go):
+> 1. `POST api.workos.com/.../authorize/device` → get device_code + authorization link
+> 2. Poll `api.workos.com/.../authenticate` → get the WorkOS access_token after authorization succeeds
+> 3. `POST api.cline.bot/api/v1/auth/register` → exchange the WorkOS token for Cline's refreshToken
 
-### 方式②：GitHub Actions 工作流（无需本地环境，手机上也能操作）⭐
+### Option 2: GitHub Actions workflow (no local environment needed, works from a phone) ⭐
 
-仓库自带 `.github/workflows/get-token.yml` 工作流，**在手机上也能跑**：你只需在手机浏览器点开 TG 推送的授权链接完成登录，脚本在云端自动轮询，拿到的 refreshToken **只私发到你的 Telegram，绝不进 Actions 日志**。
+The repo ships with a `.github/workflows/get-token.yml` workflow that **runs even from a phone**: you only need to open the authorization link pushed via Telegram on your phone browser and complete the login; the script polls in the cloud automatically and the resulting refreshToken is **sent only to your Telegram, never into the Actions logs**.
 
-**第一步：配置 TG 变量（强制，不配不运行）**
+**Step 1: Configure Telegram variables (required, the workflow refuses to run without them)**
 
-在仓库 **Settings → Secrets and variables → Actions** 里添加两个 secret：
-- `TG_BOT_TOKEN`：你的 Telegram Bot 的 token
-- `TG_CHAT_ID`：接收消息的 chat_id（你自己的 id）
+In the repo's **Settings → Secrets and variables → Actions**, add two secrets:
+- `TG_BOT_TOKEN`: your Telegram Bot token
+- `TG_CHAT_ID`: the chat_id that receives messages (your own id)
 
-> 缺任一个，工作流都会直接报错退出，不进入授权流程。
+> If either is missing, the workflow exits immediately with an error and never enters the authorization flow.
 
-**第二步：手动触发**
+**Step 2: Trigger manually**
 
-1. 进入仓库 **Actions** 页 → 点击左侧 **「获取 Cline refreshToken」**
-2. 点右边 **Run workflow** → 可选手动填授权等待秒数（默认 300）→ 运行
-3. Telegram 会收到**授权链接 + 设备码** → 用手机/电脑浏览器打开，Google/GitHub/邮箱 登录授权
-4. 授权成功 → TG 收到 **`refreshToken`**，直接复制填入 CF Worker 机密变量即可
+1. Go to the repo's **Actions** page → click **"Get Cline refreshToken"** in the left sidebar
+2. Click **Run workflow** on the right → optionally set the authorization wait seconds (default 300) → run
+3. Telegram receives the **authorization link + device code** → open it in a phone/PC browser and log in with Google/GitHub/email to authorize
+4. On success → Telegram receives the **`refreshToken`**, copy it straight into your CF Worker secret variable
 
-**安全说明：**
-- 🔒 `refreshToken` 与账号**邮箱都不会出现在 Actions 日志**（`::add-mask::` 双重打码 + 只推 TG）
-- 🔁 工作流运行完自动**清理旧运行记录，只保留最新 1 条**
-- ⏱️ 授权链接推送 TG 失败会中止，宁可失败也不把 token 写进日志
+**Security notes:**
+- 🔒 The `refreshToken` and account **email never appear in Actions logs** (`::add-mask::` double masking + Telegram-only delivery)
+- 🔁 After each run the workflow automatically **cleans up old runs, keeping only the latest one**
+- ⏱️ If pushing the authorization link to Telegram fails, the workflow aborts — better to fail than leak the token into logs
 
-### 方式③：在原版 Go 程序里提取（如果你已经用过 cline2api）
+### Option 3: Extract from the original Go program (if you already used cline2api)
 
-1. 下载原版 [cline2api releases](https://github.com/luawei1/cline2api/releases) 的运行文件
-2. 运行 `./cline-proxy --login`，浏览器登录 Cline
-3. 打开 `~/.cline2api/.cline-accounts.json`，找到 `refreshToken` 字段，复制它
+1. Download a release binary from [cline2api releases](https://github.com/luawei1/cline2api/releases)
+2. Run `./cline-proxy --login`, log in to Cline in the browser
+3. Open `~/.cline2api/.cline-accounts.json`, find the `refreshToken` field, copy it
 
 ---
 
-## 二、部署到 Cloudflare Workers
+## 2. Deploy to Cloudflare Workers
 
-> ⚠️ **推荐方式：复制代码粘贴部署，不要用 Git 关联仓库部署。**
-> 实测 GitHub 关联 CF 部署（Git 集成）容易因入口文件/构建环境问题导致部署失败，
-> 且改环境变量后不会自动生效。用下方「复制代码」方式最稳、最快。
+> ⚠️ **Recommended method: copy-paste the code, do NOT deploy via Git integration.**
+> In practice, GitHub-linked CF deployment (Git integration) often fails due to entry-file/build-environment issues,
+> and changing environment variables doesn't take effect automatically. The "copy code" method below is the most stable and fastest.
 
-### 需要的东西
+### What you need
 
-- 一个 Cloudflare 账号（免费注册：[dash.cloudflare.com](https://dash.cloudflare.com)）
-- 上一步拿到的 `CLINE_REFRESH_TOKEN`
+- A Cloudflare account (free signup: [dash.cloudflare.com](https://dash.cloudflare.com))
+- The `CLINE_REFRESH_TOKEN` obtained in the previous step
 
-### 部署步骤（复制代码版，推荐 ✅）
+### Deployment steps (copy-paste method, recommended ✅)
 
-1. 打开本仓库 `worker.js`，**全选复制全部代码**
-2. 登录 [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **创建** → **创建 Worker**
-3. 名字填 `cline2api`（可自定义）→ **部署**
-4. 进入 Worker → **编辑代码** → 删除默认代码，**粘贴**刚才复制的 `worker.js` 全部内容 → **部署**（右上角）
-5. **配置环境变量**（重点 ⚠️）：
-   - Worker → **设置** → **变量和机密** → **添加**：
-     - **机密(Secret)**：`CLINE_REFRESH_TOKEN` = 第一步拿到的 refreshToken（必填）
-       - **支持多账号**：一行一个 token，见下文「多账号」章节
-     - **机密(Secret)**：`API_KEY` = 你的访问密钥，例如 `sk-cline-xxx`（建议必填，可自定义）
-   - ⚠️ **保存后必须再点一次「部署」触发重新编译**，变量才会生效！
-6. 完成！你的 API Base URL 就是 `https://cline2api.<你的子域>.workers.dev`
+1. Open this repo's `worker.js`, **select all and copy the entire code**
+2. Log in at [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **Create** → **Create Worker**
+3. Name it `cline2api` (customizable) → **Deploy**
+4. Enter the Worker → **Edit code** → delete the default code, **paste** the full `worker.js` content you copied → **Deploy** (top right)
+5. **Configure environment variables** (important ⚠️):
+   - Worker → **Settings** → **Variables and Secrets** → **Add**:
+     - **Secret**: `CLINE_REFRESH_TOKEN` = the refreshToken from step one (required)
+       - **Multi-account supported**: one token per line, see the "Multi-account" section below
+     - **Secret**: `API_KEY` = your access key, e.g. `sk-cline-xxx` (recommended, customizable)
+   - ⚠️ **After saving you MUST click "Deploy" again to trigger recompilation**, or the variables won't take effect!
+6. Done! Your API Base URL is `https://cline2api.<your-subdomain>.workers.dev`
 
-> 💡 验证环境变量是否生效，访问诊断端点：
+> 💡 To verify the environment variables are active, hit the diagnostic endpoint:
 > ```bash
-> curl https://cline2api.<你的子域>.workers.dev/v1/health
+> curl https://cline2api.<your-subdomain>.workers.dev/v1/health
 > ```
-> 返回 `api_key_configured: true` 即表示变量已生效，`account_count` 显示已配置的账号数量。
+> If it returns `api_key_configured: true` the variables are live; `account_count` shows how many accounts are configured.
 
-### 需要的东西&环境变量说明
+### Variables reference
 
-| 变量名 | 类型 | 必填 | 说明 |
+| Variable | Type | Required | Description |
 |---|---|---|---|
-| `CLINE_REFRESH_TOKEN` | 机密 Secret | ✅ | Cline 账号 refreshToken，**一行一个，支持多账号** |
-| `API_KEY` | 机密 Secret | 建议 | 客户端访问密钥；不设则用默认 `cline2api-default-key` |
+| `CLINE_REFRESH_TOKEN` | Secret | ✅ | Cline account refreshToken, **one per line, multi-account supported** |
+| `API_KEY` | Secret | Recommended | Client access key; if unset, defaults to `cline2api-default-key` |
 
-> 变量名必须**完全一致**（全大写、无空格）。修改后**务必保存并重新部署**才会生效。
+> Variable names must match **exactly** (all caps, no spaces). After changing them you **must save and redeploy** for changes to take effect.
 
-### 🔁 多账号（额度用完自动切号）⭐
+### 🔁 Multi-account (auto-switch when quota runs out) ⭐
 
-一个账号的免费额度/限流用完时，想切下一个号？不用改任何东西，**在 `CLINE_REFRESH_TOKEN` 里一行填一个 token 即可**：
+When one account's free quota/rate limit runs out and you want to switch to the next? No need to change anything — just put **one token per line in `CLINE_REFRESH_TOKEN`**:
 
 ```
-第一个账号的refreshToken
-第二个账号的refreshToken
-第三个账号的refreshToken
+first-account-refreshToken
+second-account-refreshToken
+third-account-refreshToken
 ```
 
-**工作机制：**
-- 🔄 **账号池轮询**：请求轮流使用不同账号（round-robin），分散单账号压力
-- ⚡ **额度用完/限流自动切号**：某账号触发 429（`Daily free limit reached`）或空响应，
-  **解析上游冷却提示**（如 `Try again in 2h 51m`），按实际时长冷却该账号并切换到下一个，同一请求换号重试
-- 🚫 **失效自动跳过**：刷新失败的账号会被跳过，不阻塞
-- ✅ **独立缓存**：每个账号各自的 accessToken 独立缓存，互不影响
-- 🛡️ **全部冷却不空转**：所有账号均冷却时直接返回上游响应，不盲目重试
-- 单账号时完全兼容，原样工作
+**How it works:**
+- 🔄 **Account pool round-robin**: requests rotate across accounts, spreading load
+- ⚡ **Auto-switch on quota exhaustion / rate limit**: if an account hits a 429 (`Daily free limit reached`) or an empty response,
+  the worker **parses the upstream cooldown hint** (e.g. `Try again in 2h 51m`), cools that account down for exactly that duration and switches to the next one, retrying the same request
+- 🚫 **Dead accounts are skipped automatically**: failed refreshes don't block anything
+- ✅ **Independent caches**: each account's accessToken is cached independently
+- 🛡️ **No spinning when all accounts cool down**: returns the upstream response directly instead of blindly retrying
+- Fully backward compatible with a single account
 
-**验证：** 部署后访问 `/v1/health`，返回 `account_count` 即当前账号数量。
+**Verify:** after deployment, visit `/v1/health`; `account_count` is the number of configured accounts.
 
-### 验证部署
+### Verify the deployment
 
 ```bash
-curl https://cline2api.<你的子域>.workers.dev/v1/models \
-  -H "Authorization: Bearer <你的API_KEY>"
+curl https://cline2api.<your-subdomain>.workers.dev/v1/models \
+  -H "Authorization: Bearer <YOUR_API_KEY>"
 ```
-应返回模型列表。再发一次聊天：
+It should return the model list. Then send a chat request:
 
 ```bash
-curl https://cline2api.<你的子域>.workers.dev/v1/chat/completions \
-  -H "Authorization: Bearer <你的API_KEY>" \
+curl https://cline2api.<your-subdomain>.workers.dev/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"model":"poolside/laguna-s-2.1:free","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"poolside/laguna-s-2.1:free","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ---
 
-## 三、在 AgentScope 平台调用（模型接入）
+## 3. Using with AgentScope (model integration)
 
-把该 Worker 当作 OpenAI 兼容 API 接入 **AgentScope（QwenPaw / qwenpaw.agentscope.io）** 时：
+When hooking this Worker into **AgentScope (QwenPaw / qwenpaw.agentscope.io)** as an OpenAI-compatible API:
 
-### ⚠️ 关键：直接用 Workers 域名，不要用自定义域名
+### ⚠️ Key point: use the Workers domain directly, not a custom domain
 
-- **用 `https://cline2api.<你的子域>.workers.dev/v1`** 作为模型 **Base URL / API Base**。
-- **不要用绑定的自定义域名**（如 `api.llm.xxx.com`）：AgentScope 平台对接时，
-  自定义域名可能因证书/路由/鉴权头处理问题导致调用失败或鉴权不过，
-  直接用 Workers 官方域名最稳。
+- Use **`https://cline2api.<your-subdomain>.workers.dev/v1`** as the model **Base URL / API Base**.
+- Do **not** use a bound custom domain (e.g. `api.llm.xxx.com`): during AgentScope integration,
+  custom domains can fail due to certificate/routing/auth-header handling issues.
+  The official Workers domain is the most reliable.
 
-### AgentScope 里怎么配（OpenAI 兼容模式）
+### How to configure in AgentScope (OpenAI-compatible mode)
 
-- **API Base / Base URL**：`https://cline2api.<你的子域>.workers.dev/v1`
-  （部分平台要求不带 `/v1` 的填写为 `https://cline2api.<你的子域>.workers.dev`，按平台提示试）
-- **API Key**：填你设置的 `API_KEY` 值（如 `sk-cline-xxx`）
-- **Model**：`deepseek/deepseek-v4-flash`（默认）或 `poolside/laguna-s-2.1:free`、`zai/glm-5.2`（付费，约 $0.0008/次）。
-  `depth/deepseek-v4-flash` 是 `deepseek/deepseek-v4-flash` 的拼写别名，同款免费，任意前缀均可。
+- **API Base / Base URL**: `https://cline2api.<your-subdomain>.workers.dev/v1`
+  (some platforms want the field without `/v1`: `https://cline2api.<your-subdomain>.workers.dev`; try whichever the platform suggests)
+- **API Key**: the `API_KEY` value you set (e.g. `sk-cline-xxx`)
+- **Model**: `deepseek/deepseek-v4-flash` (default), `poolside/laguna-s-2.1:free`, or `zai/glm-5.2` (paid, ~$0.0008/request).
+  `depth/deepseek-v4-flash` is a spelling alias of `deepseek/deepseek-v4-flash` — same free model, any prefix works.
 
-> 若 AgentScope 平台走的标准 OpenAI SDK，直接指定上述 base_url + api_key 即可。
-> 若测试报 401，请确认 `API_KEY` 变量已在 CF 配置并重新部署过。
+> If AgentScope uses the standard OpenAI SDK, just set the base_url + api_key above.
+> If testing returns 401, make sure the `API_KEY` variable was configured in CF and redeployed.
 
-### ⚠️ 高级配置：给模型加自定义请求头（防 Workers 返回 1010）
+### ⚠️ Advanced: add a custom User-Agent header to the model (prevents Workers error 1010)
 
-**重要**：Cline 的 Workers 网关对**非浏览器 UA 的请求**可能直接拦截返回
-**`1010`**（浏览器 / 非 Cloudflare Workers 页面访问报错）。你在 AgentScope 里配完
-Base URL / API Key / Model 后，如果**一调用就报 1010 或连接失败**，十有八九是
-请求头里的 `User-Agent` 太"机器"（如 curl / python-httpx / 平台默认 SDK UA）被网关挡了。
+**Important**: Cline's Workers gateway may block requests with **non-browser UAs outright** with
+error **`1010`** (an error seen when accessed from browsers / non-Cloudflare-Workers pages). In AgentScope, after configuring
+Base URL / API Key / Model, if **every call fails with 1010 or a connection error**, odds are the request's
+`User-Agent` is too "robotic" (e.g. curl / python-httpx / the platform's default SDK UA) and got blocked by the gateway.
 
-**解决办法**：在**模型的「高级设置 / 自定义请求头」**里加一个浏览器 UA：
+**Fix**: add a browser UA under the model's **Advanced settings / Custom headers**:
 
 ```text
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
 ```
 
-**AgentScope 平台具体操作**：模型配置页 → 找到该模型的**高级设置 / 自定义 Headers（请求头）**区域，
-新增一条请求头：
-- 键（Key）：`User-Agent`
-- 值（Value）：上面那串 Chrome 浏览器 UA
+**In AgentScope specifically**: on the model config page → find the model's **Advanced settings / Custom Headers** area,
+add one header:
+- Key: `User-Agent`
+- Value: the Chrome UA string above
 
-保存后重试即可，Workers 就会把它当成正规浏览器流量放行。
+Save and retry — the Workers gateway will treat it as normal browser traffic.
 
-> 💡 记一下：**任何平台接这个 Worker 报 1010，第一反应就是补这个浏览器 UA 请求头**，
-> 因为网关只按 UA 判是不是浏览器，跟你的 API Key 正不正确无关。加完 UA 还报 401 才去查 Key。
+> 💡 Rule of thumb: **if any platform gets 1010 against this Worker, add this browser UA header first**.
+> The gateway judges "browser or not" purely by UA, regardless of whether your API Key is correct. Only investigate the Key if you still get 401 after adding the UA.
 
 ---
 
-## 四、使用
+## 4. Usage
 
 ```text
-Base URL: https://cline2api.<你的子域>.workers.dev/v1
-API Key:  <你设置的 API_KEY>
-Model:    deepseek/deepseek-v4-flash   （默认）
+Base URL: https://cline2api.<your-subdomain>.workers.dev/v1
+API Key:  <the API_KEY you set>
+Model:    deepseek/deepseek-v4-flash   (default)
 ```
 
-兼容 OpenAI 客户端（`/v1/chat/completions`）和 Anthropic 客户端（`/v1/messages`，自动转换）。
+Compatible with OpenAI clients (`/v1/chat/completions`) and Anthropic clients (`/v1/messages`, auto-converted).
 
-### 可用模型（实测）
+### Available models (tested)
 
-| 模型 ID | 结果 |
+| Model ID | Result |
 |---|---|
-| `deepseek/deepseek-v4-flash` | ✅ **免费可用**（默认；需完整 Cline 客户端头 + 强制 stream，已修复） |
-| `depth/deepseek-v4-flash` | ✅ **免费可用**（`deepseek/deepseek-v4-flash` 的拼写别名，同款，前端任一前缀均可） |
-| `poolside/laguna-s-2.1:free` | ✅ **免费可用** |
-| `zai/glm-5.2` | ✅ **可用（付费）**，走 Cline 系统凭证，约 $0.0008/次 |
-| `cline-free/glm-5.2` | ❌ **已下架**（上游 404 `model not found`，2026-08-06 实测） |
-| `cline-pass/*` | ❌ 403，需付费 cline-pass 订阅 |
+| `deepseek/deepseek-v4-flash` | ✅ **Free, working** (default; requires full Cline client headers + forced streaming, fixed) |
+| `depth/deepseek-v4-flash` | ✅ **Free, working** (spelling alias of `deepseek/deepseek-v4-flash`, same model, any prefix works) |
+| `poolside/laguna-s-2.1:free` | ✅ **Free, working** |
+| `zai/glm-5.2` | ✅ **Working (paid)**, uses Cline system credentials, ~$0.0008/request |
+| `cline-free/glm-5.2` | ❌ **Delisted** (upstream 404 `model not found`, tested 2026-08-06) |
+| `cline-pass/*` | ❌ 403, requires a paid cline-pass subscription |
 
-> ⚠️ **2026-08-06 更新**：
-> - **`cline-free/glm-5.2` 上游已下架**：该免费模型名在 Cline 上游返回 404 `model not found`（非请求头问题，
->   与 deepseek 同款 Cline 指纹头仍返回 200）。同模型的付费通道 `zai/glm-5.2` 可用（约 $0.0008/次，
->   走 Cline 系统凭证），`cline-pass/glm-5.2` 需订阅返回 403。
-> - 若你的 AgentScope 里还配着 `cline-free/glm-5.2`，请改配 `deepseek/deepseek-v4-flash`（免费）或 `zai/glm-5.2`（付费）。
+> ⚠️ **2026-08-06 update**:
+> - **`cline-free/glm-5.2` delisted upstream**: that free model name now returns 404 `model not found` from Cline upstream (not a header issue —
+>   the same Cline fingerprint headers used for deepseek still return 200). The paid channel for the same model, `zai/glm-5.2`, works (~$0.0008/request,
+>   using Cline system credentials); `cline-pass/glm-5.2` needs a subscription and returns 403.
+> - If your AgentScope still has `cline-free/glm-5.2` configured, switch to `deepseek/deepseek-v4-flash` (free) or `zai/glm-5.2` (paid).
 >
-> ⚠️ **2026-08-05 修复记录**：
-> - **403 "only available via Cline product surfaces"**：worker 请求头太精简，被官方识别为第三方调用。
->   修复：补齐完整 Cline 客户端指纹头（`User-Agent: Cline/3.0.47`、`HTTP-Referer`、`X-CLIENT-TYPE: cline-sdk`、
->   `X-CLIENT-VERSION`、`X-PLATFORM` 等），`deepseek/deepseek-v4-flash` 和 `cline-free/glm-5.2` 恢复可用。
-> - **非流式 500 "empty response content"**：上游对免费通道（deepseek + cline-free）的非流式请求限流，但流式正常。
->   修复：客户端要非流式时，worker 强制上游走 stream，聚合 chunks 后返回非流式响应。
-> - **429 "Daily free limit reached"**：不是 bug，是**账号每日免费额度**用完（`Try again in Xh Xm`）。
->   这是 Cline 官方对免费模型的日配额，等冷却结束自动恢复；多账号可缓解（`CLINE_REFRESH_TOKEN` 多行填多个 token）。
-> - **多账号 429 自动切号**：429 限流时自动解析上游冷却时长（如 `Try again in 2h 51m`），
->   冷却该账号并切换到下一个可用账号重试同一请求；所有账号均冷却时直接返回上游响应，不空转。
+> ⚠️ **2026-08-05 fix log**:
+> - **403 "only available via Cline product surfaces"**: the worker's request headers were too minimal, so the official side flagged it as third-party traffic.
+>   Fix: added the complete Cline client fingerprint headers (`User-Agent: Cline/3.0.47`, `HTTP-Referer`, `X-CLIENT-TYPE: cline-sdk`,
+>   `X-CLIENT-VERSION`, `X-PLATFORM`, etc.), restoring `deepseek/deepseek-v4-flash` and `cline-free/glm-5.2`.
+> - **Non-streaming 500 "empty response content"**: upstream rate-limits non-streaming requests on the free channels (deepseek + cline-free), while streaming works fine.
+>   Fix: when the client asks for non-streaming, the worker forces stream toward upstream and aggregates chunks back into a non-streaming response.
+> - **429 "Daily free limit reached"**: not a bug — the **account's daily free quota** ran out (`Try again in Xh Xm`).
+>   This is Cline's official daily quota for free models; it recovers automatically after the cooldown. Multi-account helps mitigate it (multiple tokens on separate lines in `CLINE_REFRESH_TOKEN`).
+> - **Multi-account auto-switch on 429**: on 429 rate limits, the upstream cooldown duration is parsed (e.g. `Try again in 2h 51m`),
+>   that account is cooled down, and the same request is retried on the next available account; when all accounts are cooling, the upstream response is returned as-is instead of spinning.
 
 ---
 
-## 五、项目结构
+## 5. Project structure
 
 ```
 .
-├── worker.js               # 主 Worker 代码（部署核心）
-├── cline_oauth.py          # 获取 CLINE_REFRESH_TOKEN 的脚本 ⭐
+├── worker.js               # Main Worker code (deployment core)
+├── cline_oauth.py          # Script to obtain CLINE_REFRESH_TOKEN ⭐
 ├── .github/workflows/
-│   └── get-token.yml       # 手动运行的工作流：在 TG 上获取 refreshToken
-├── wrangler.toml           # (可选) wrangler 命令行部署配置，用复制代码方式可忽略
-├── test_request.json       # 测试请求示例
-└── README.md               # 本文件
+│   └── get-token.yml       # Manually-run workflow: fetch refreshToken via Telegram
+├── wrangler.toml           # (Optional) wrangler CLI deployment config; ignore if copy-pasting
+├── test_request.json       # Sample test request
+└── README.md               # This file
 ```
 
-## 六、获取 refreshToken 常见问题
+## 6. refreshToken FAQ
 
-**Q: 谁能看到我的 refreshToken？**
-→ 只有你。它存在 CF Workers 的**机密变量**里（加密存储，代码里看不到、日志里不显示）。不要把 `wrangler.toml` 里的变量跟真实 refreshToken 混写，机密务必用 `wrangler secret` 或 Dashboard 的"机密"类型。
+**Q: Who can see my refreshToken?**
+→ Only you. It lives in CF Workers **secret variables** (encrypted storage, invisible in code and logs). Don't mix real refreshTokens into `wrangler.toml` variables — secrets must use `wrangler secret` or the Dashboard's "Secret" type.
 
-**Q: refreshToken 会过期吗？**
-→ 会，但 Cline 的 refreshToken 有效期较长。如果将来请求返回 401/403 token 失效，重新跑 `cline_oauth.py` 拿新的即可。
+**Q: Does the refreshToken expire?**
+→ Yes, but Cline's refreshToken has a fairly long validity. If requests start returning 401/403 token-invalid errors later, just rerun `cline_oauth.py` for a new one.
 
-**Q: 免费额度够用吗？**
-→ `deepseek/deepseek-v4-flash`（默认）和 `poolside/laguna-s-2.1:free` 都是免费模型。
-   deepseek 有**每日免费额度**（用尽返回 429 "Daily free limit reached"，数小时后恢复）；
-   多账号可缓解（`CLINE_REFRESH_TOKEN` 多行填多个 token，额度用尽自动切号）。
-   `zai/glm-5.2` 为付费模型（约 $0.0008/次），走 Cline 系统凭证，无每日额度限制。
+**Q: Is the free quota enough?**
+→ Both `deepseek/deepseek-v4-flash` (default) and `poolside/laguna-s-2.1:free` are free models.
+   deepseek has a **daily free quota** (when exhausted it returns 429 "Daily free limit reached", recovering hours later);
+   multi-account mitigates this (one token per line in `CLINE_REFRESH_TOKEN`, auto-switching when quota runs out).
+   `zai/glm-5.2` is a paid model (~$0.0008/request) using Cline system credentials, with no daily quota limit.
 
 ---
 
-## 许可
+## License
 
 MIT © 2026 pingmike2

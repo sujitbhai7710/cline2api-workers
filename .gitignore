@@ -1,4 +1,4 @@
-# 敏感文件，绝不提交！
+# Sensitive files, never commit!
 .env.local
 .env
 *.local
@@ -8,9 +8,9 @@ __pycache__/
 *.pyc
 .venv/
 
-# 部署产物
+# Build artifacts
 node_modules/
 dist/
 
-# 本地测试副本（worker.js 的测试用拷贝，避免双份维护）
+# Local test copy (test-only copy of worker.js, to avoid maintaining it twice)
 test/

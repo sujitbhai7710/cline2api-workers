@@ -2,5 +2,5 @@ name = "cline2api"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
-# 部署后输出 https://cline2api.<你的子域>.workers.dev
-# 注意：CLINE_REFRESH_TOKEN 必须用 wrangler secret 设置，不要写在这里！
+# After deployment: https://cline2api.<your-subdomain>.workers.dev
+# Note: CLINE_REFRESH_TOKEN must be set via `wrangler secret`, do not put it here!
