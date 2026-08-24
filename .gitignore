@@ -2,6 +2,7 @@
 .env.local
 .env
 *.local
+refresh_tokens.txt
 
 # Python
 __pycache__/

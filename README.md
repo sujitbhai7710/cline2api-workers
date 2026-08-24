@@ -27,7 +27,10 @@ python3 cline_oauth.py
 #    Open it in your browser and authorize with Google / GitHub / email
 
 # 3. Once authorized, the script polls automatically and prints the refreshToken
+#    AND auto-saves it to refresh_tokens.txt
 ```
+
+**Multi-account made easy 💾**: every successful login **appends the new refreshToken to `refresh_tokens.txt` (one per line, duplicates skipped)** — so just run `cline_oauth.py` again and sign in with a different Google/GitHub/email account; tokens stack up in the file automatically. When you're done, that file's contents are exactly what goes into the Cloudflare `CLINE_REFRESH_TOKEN` secret. (`refresh_tokens.txt` is git-ignored and never written on CI runners.)
 
 > What the script does internally (reverse-engineered from auth.go):
 > 1. `POST api.workos.com/.../authorize/device` → get device_code + authorization link

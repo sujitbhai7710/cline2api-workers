@@ -10,6 +10,11 @@ Flow (reverse-engineered from cline2api/auth.go):
   3. On success → call api.cline.bot/api/v1/auth/register with the WorkOS token
   4. Get the refreshToken → paste it into the Cloudflare Worker secret variable
 
+Local auto-save:
+  Every successful login appends the refreshToken to refresh_tokens.txt, one per line,
+  so multiple accounts simply stack up — run once per account. Duplicates are skipped.
+  Override the file with the REFRESH_TOKENS_FILE env var. Never written on CI runners.
+
 Security behavior inside GitHub Actions (important):
   * When TG_BOT_TOKEN / TG_CHAT_ID are configured, both the authorization link and
     the refreshToken are pushed to Telegram, and **the refreshToken is never printed
@@ -20,6 +25,7 @@ Environment variables:
   TG_BOT_TOKEN         Telegram Bot Token (optional; pushes only when set together with TG_CHAT_ID)
   TG_CHAT_ID           Telegram receiving chat_id (optional)
   OAUTH_POLL_TIMEOUT   Authorization wait seconds (optional; defaults to WorkOS's expires_in)
+  REFRESH_TOKENS_FILE  Local save path (optional; default refresh_tokens.txt)
 
 Dependencies: Python 3 standard library only, no pip installs needed.
 """
@@ -66,6 +72,34 @@ def mask_value(value):
     """Mask a sensitive value in GitHub Actions logs when running in CI (masked even if accidentally printed)."""
     if in_ci() and value:
         print(f"::add-mask::{value}")
+
+
+def tokens_file_path():
+    """Path of the local file where refreshTokens are auto-saved (one per line)."""
+    return os.environ.get("REFRESH_TOKENS_FILE", "refresh_tokens.txt")
+
+
+def save_token_to_file(rt):
+    """Append the refreshToken to the tokens file on a new line.
+
+    New accounts are appended automatically; duplicates are skipped.
+    Never writes the file on CI runners (GitHub Actions) — tokens live only
+    in Telegram there. Returns True if the token was newly added.
+    """
+    if in_ci():
+        return False
+    path = tokens_file_path()
+    existing = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = [line.strip() for line in f if line.strip()]
+    if rt in existing:
+        print(f"ℹ️ Token already saved in {path}, skipping duplicate.")
+        return False
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(rt + "\n")
+    print(f"💾 Saved to {path} (account #{len(existing) + 1}). Run again with another account to append more.")
+    return True
 
 
 def post_form(url, form):
@@ -178,6 +212,9 @@ def main():
     print("\n" + "=" * 60)
     # Displayed after masking; logs show ***
     print(f"✅ Login successful! Account: {email}")
+
+    # Auto-save locally (appends on a new line, skips duplicates; skipped on CI runners)
+    save_token_to_file(rt)
 
     # Key security point: in CI with Telegram configured, the refreshToken is only pushed
     # to Telegram, never printed to logs
