@@ -45,7 +45,48 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.1.7";
+const VERSION = "1.1.8";
+
+// Loose spellings clients commonly send, mapped to canonical model IDs
+const MODEL_ALIASES = {
+  "ox-alpha": "stealth/ox-alpha",
+  "0x-alpha": "stealth/ox-alpha",
+  "0xalpha": "stealth/ox-alpha",
+  "oxalpha": "stealth/ox-alpha",
+  "x-preview-f-free": "stealth/ox-alpha",
+  "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "depth/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "laguna-s-2.1": "poolside/laguna-s-2.1:free",
+  "laguna-s-2.1-free": "poolside/laguna-s-2.1:free",
+};
+
+// Resolve a client-supplied model name into a MODELS entry.
+// Order: exact ID → alias table → slug match (ignores prefix/suffix/case/spelling of "0x")
+// → passthrough for well-formed "provider/model" strings → null (caller falls back to default).
+function resolveModel(raw) {
+  const input = String(raw || "").trim();
+  const byId = MODELS.find((m) => m.id === input);
+  if (byId) return byId;
+
+  // Normalize for comparison: lowercase, spaces/underscores → dashes, "0x" → "ox", drop ":free"-style suffixes
+  const canon = (s) => s.split(":")[0].trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/^0x/, "ox");
+
+  const aliased = MODEL_ALIASES[canon(input)];
+  if (aliased) {
+    return MODELS.find((m) => m.id === aliased) || null;
+  }
+
+  const slug = canon(input.split("/").pop());
+  const matched = MODELS.find((m) => canon(m.upstream.split("/").pop()) === slug);
+  if (matched) return matched;
+
+  if (input.includes("/") && input.split("/").every((p) => p.trim().length > 0)) {
+    // Well-formed provider/model string we don't know: forward as-is and let upstream decide
+    return { id: input, upstream: input };
+  }
+  // Malformed (no slash, unknown name): fall back to the default model instead of a 400
+  return null;
+}
 
 export default {
   async fetch(request, env) {
@@ -370,9 +411,9 @@ async function handleChat(request, env) {
 
   const isStream = !!params.stream;
   const sessionId = "sess_" + Date.now();
-  const model = params.model || DEFAULT_MODEL;
-  const modelConfig = MODELS.find((m) => m.id === model);
-  const upstreamModel = modelConfig?.upstream || model;
+  const modelConfig = resolveModel(params.model) || MODELS.find((m) => m.id === DEFAULT_MODEL);
+  const model = modelConfig.id;
+  const upstreamModel = modelConfig.upstream;
 
   // Build the upstream body (external model IDs kept separate from Cline upstream IDs)
   const body = {
@@ -562,9 +603,9 @@ async function handleAnthropic(request, env) {
 
   const isStream = !!req.stream;
   const sessionId = "sess_" + Date.now();
-  const requestedModel = req.model || DEFAULT_MODEL;
-  const modelConfig = MODELS.find((m) => m.id === requestedModel);
-  const upstreamModel = modelConfig?.upstream || requestedModel;
+  const modelConfig = resolveModel(req.model) || MODELS.find((m) => m.id === DEFAULT_MODEL);
+  const requestedModel = modelConfig.id;
+  const upstreamModel = modelConfig.upstream;
 
   // Anthropic → OpenAI message conversion
   const messages = [];
