@@ -33,8 +33,9 @@ let currentAccount = null;     // account currently in use (safe under the seria
 // No artificial cline/ prefix is added; Telegram displays these full IDs,
 // avoiding confusion when different providers' model names get truncated.
 const MODELS = [
-  // Stealth preview model listed on Cline's free tier ("Ox Alpha"; early free access).
-  // Same ID upstream and downstream; rides the free channel at $0 during the preview window.
+  // Latest free GLM multimodal model (added 2026-08-25) — Cline's current free tier.
+  { id: "z-ai/glm-5.3-flash", upstream: "z-ai/glm-5.3-flash", provider: "z-ai", cost: "free" },
+  // Stealth preview model ("Ox Alpha"; early free access) — kept for backward compatibility.
   { id: "stealth/ox-alpha", upstream: "stealth/ox-alpha", provider: "stealth", cost: "free" },
   { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
   { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
@@ -45,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.1.8";
+const VERSION = "1.1.9";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -54,6 +55,9 @@ const MODEL_ALIASES = {
   "0xalpha": "stealth/ox-alpha",
   "oxalpha": "stealth/ox-alpha",
   "x-preview-f-free": "stealth/ox-alpha",
+  "glm-5.3-flash": "z-ai/glm-5.3-flash",
+  "zai/glm-5.3-flash": "z-ai/glm-5.3-flash",
+  "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash",
   "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
   "depth/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
   "laguna-s-2.1": "poolside/laguna-s-2.1:free",
@@ -423,10 +427,10 @@ async function handleChat(request, env) {
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
     messages: params.messages || [],
   };
-  // ⚠️ Free channels (deepseek, stealth): non-streaming requests get rate-limited upstream (500 empty response content)
+  // ⚠️ Free channels (deepseek, stealth, z-ai): non-streaming requests get rate-limited upstream (500 empty response content)
   //    while streaming works. So when the client asks for non-streaming, force stream toward
   //    upstream and aggregate the chunks back into a non-streaming response.
-  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/"));
+  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/") || upstreamModel.startsWith("z-ai/"));
   if (isStream || forceStream) body.stream = true;
   // Pass through optional parameters
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
@@ -625,8 +629,8 @@ async function handleAnthropic(request, env) {
     reasoning_effort: "high",
     messages,
   };
-  // ⚠️ Free channels (deepseek, stealth): non-streaming is rate-limited upstream, force stream and aggregate
-  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/"));
+  // ⚠️ Free channels (deepseek, stealth, z-ai): non-streaming is rate-limited upstream, force stream and aggregate
+  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/") || upstreamModel.startsWith("z-ai/"));
   if (isStream || forceStream) body.stream = true;
   if (req.temperature !== undefined) body.temperature = req.temperature;
   if (req.top_p !== undefined) body.top_p = req.top_p;
