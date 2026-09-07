@@ -120,9 +120,10 @@ third-account-refreshToken
 ```
 
 **How it works:**
-- 🔄 **Account pool round-robin**: requests rotate across accounts, spreading load
-- ⚡ **Auto-switch on quota exhaustion / rate limit**: if an account hits a 429 (`Daily free limit reached`) or an empty response,
+- 🔄 **Account pool rotation**: every request starts from the next account in the pool (round-robin cursor), so quota burns evenly across accounts instead of hammering #1 until it 429s. Cooling/failed accounts are skipped automatically.
+- ⚡ **Quota exhaustion / rate limit auto-switch**: if an account hits a 429 (`Daily free limit reached`) or an empty response,
   the worker **parses the upstream cooldown hint** (e.g. `Try again in 2h 51m`), cools that account down for exactly that duration and switches to the next one, retrying the same request
+- 🔍 **Verifiable**: every successful response carries an `X-Cline-Account` header (e.g. `3/7`) showing which pool position served it
 - 🚫 **Dead accounts are skipped automatically**: failed refreshes don't block anything
 - ✅ **Independent caches**: each account's accessToken is cached independently
 - 🛡️ **No spinning when all accounts cool down**: returns the upstream response directly instead of blindly retrying

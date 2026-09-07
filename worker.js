@@ -46,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.1.9";
+const VERSION = "1.1.10";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -214,27 +214,19 @@ async function getAccountToken(account) {
   return accessToken;
 }
 
-// Pick an available account round-robin, return the account object (and set currentAccount)
-function pickAccount(pool) {
-  for (let k = 0; k < pool.length; k++) {
-    const acc = pool[accountIndex % pool.length];
-    accountIndex = (accountIndex + 1) % pool.length;
-    if (!acc.cooldownUntil || acc.cooldownUntil <= Date.now()) {
-      currentAccount = acc;
-      return acc;
-    }
-  }
-  return null; // all accounts cooling down
-}
-
 async function getAccessToken(env) {
   const pool = parseAccounts(env);
   if (pool.length === 0) {
     throw new Error("Missing CLINE_REFRESH_TOKEN environment variable");
   }
-  // Try at most pool.length accounts (skipping cooling/refresh-failed ones)
+  // Rotate the starting account on EVERY request so consecutive requests spread
+  // across the whole pool (even quota burn → no single account hits the daily limit first).
+  const start = accountIndex % pool.length;
+  accountIndex = (accountIndex + 1) % pool.length;
+  // Try at most pool.length accounts, beginning at the rotated position
+  // (skipping cooling/refresh-failed ones)
   for (let attempt = 0; attempt < pool.length; attempt++) {
-    const acc = pool[attempt % pool.length]; // try one by one
+    const acc = pool[(start + attempt) % pool.length]; // rotate + walk forward
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
@@ -253,6 +245,13 @@ async function getAccessToken(env) {
   } catch (e) {
     throw new Error("All accounts failed to refresh tokens");
   }
+}
+
+// Which pool position served the current request, e.g. "3/7" (for the X-Cline-Account debug header)
+function servingAccountLabel(env) {
+  const pool = parseAccounts(env);
+  const i = currentAccount ? pool.indexOf(currentAccount) : -1;
+  return (i >= 0 ? i + 1 : "?") + "/" + pool.length;
 }
 
 // Cline client fingerprint headers (the official side uses these to identify "is this a real Cline client")
@@ -445,7 +444,7 @@ async function handleChat(request, env) {
     }
     if (isStream) {
       // Client wants streaming: pass the SSE through directly
-      return streamResponse(resp, model);
+      return streamResponse(resp, model, { "X-Cline-Account": servingAccountLabel(env) });
     }
     if (forceStream) {
       // Client wants non-streaming + upstream is streaming: aggregate chunks and return
@@ -454,13 +453,13 @@ async function handleChat(request, env) {
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
       retried.data.model = model;
-      return jsonResponse(retried.data, 200);
+      return jsonResponse(retried.data, 200, { "X-Cline-Account": servingAccountLabel(env) });
     }
     // Non-streaming + non-deepseek: original logic
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     normalized.model = model;
-    return jsonResponse(normalized, 200);
+    return jsonResponse(normalized, 200, { "X-Cline-Account": servingAccountLabel(env) });
   } catch (e) {
     return jsonResponse({ error: { message: e.message, type: "api_error" } }, 500);
   }
@@ -649,19 +648,19 @@ async function handleAnthropic(request, env) {
     }
     if (isStream) {
       // Upstream is OpenAI SSE; convert to Anthropic SSE format
-      return streamResponseAnthropic(resp);
+      return streamResponseAnthropic(resp, { "X-Cline-Account": servingAccountLabel(env) });
     }
     if (forceStream) {
       // Client wants non-streaming + upstream is streaming: aggregate then convert to Anthropic
       // ⚠️ Same content check applies: the free channel occasionally returns a "200 but content empty" stream; retry on another account if empty
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
-      return jsonResponse(openAItoAnthropic(retried.data), 200);
+      return jsonResponse(openAItoAnthropic(retried.data), 200, { "X-Cline-Account": servingAccountLabel(env) });
     }
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     // OpenAI → Anthropic
-    return jsonResponse(openAItoAnthropic(normalized), 200);
+    return jsonResponse(openAItoAnthropic(normalized), 200, { "X-Cline-Account": servingAccountLabel(env) });
   } catch (e) {
     return jsonResponse({ error: { message: e.message, type: "api_error" } }, 500);
   }
@@ -681,7 +680,7 @@ function unwrapData(obj) {
 }
 
 // OpenAI SSE streaming passthrough (strips the data wrapper)
-async function streamResponse(upstream, externalModel) {
+async function streamResponse(upstream, externalModel, extraHeaders = {}) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const reader = upstream.body.getReader();
@@ -733,12 +732,13 @@ async function streamResponse(upstream, externalModel) {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       ...corsHeaders(),
+      ...extraHeaders,
     },
   });
 }
 
 // Anthropic SSE: convert upstream OpenAI chunks to Anthropic format
-async function streamResponseAnthropic(upstream) {
+async function streamResponseAnthropic(upstream, extraHeaders = {}) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const reader = upstream.body.getReader();
@@ -793,6 +793,7 @@ async function streamResponseAnthropic(upstream) {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       ...corsHeaders(),
+      ...extraHeaders,
     },
   });
 }
