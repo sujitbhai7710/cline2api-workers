@@ -46,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -393,6 +393,18 @@ function servingAccountLabel(env) {
   return (i >= 0 ? i + 1 : "?") + "/" + pool.length;
 }
 
+// Success-response debug headers: serving account + context-fallback notice (if any)
+function acctHeaders(env, fallbackUsed) {
+  const h = { "X-Cline-Account": servingAccountLabel(env) };
+  if (fallbackUsed) h["X-Cline-Fallback"] = fallbackUsed;
+  return h;
+}
+
+// Detect "prompt too big for this model's context window" upstream errors
+function isContextOverflow(text) {
+  return /context.{0,20}(length|window|limit|exceed|overflow)|too many tokens|input.{0,20}too (long|large)|max.{0,20}tokens|token.{0,20}(limit|exceed)|request.{0,20}too large|payload.{0,20}too large/i.test(text || "");
+}
+
 // Cline client fingerprint headers (the official side uses these to identify "is this a real Cline client")
 // Missing headers trigger 403: "deepseek/deepseek-v4-flash is only available via Cline product surfaces"
 function clineHeaders(sessionId) {
@@ -577,6 +589,22 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
       continue;
     }
 
+    // Transient upstream overload (502/503/529): big generations hit these under load.
+    // Short backoff + rotate to the next account, but NO long cooldown (unlike quota 429s).
+    if ((resp.status === 502 || resp.status === 503 || resp.status === 529) && attempt < maxRetries) {
+      if (currentAccount) {
+        currentAccount.cooldownUntil = Date.now() + 30 * 1000;
+        currentAccount.accessToken = null;
+        currentAccount.expiry = 0;
+        const pool = parseAccounts(env);
+        await dbMarkCooldown(env, pool.indexOf(currentAccount), Date.now() + 30 * 1000, "error",
+          `transient ${resp.status}, retrying`);
+        console.log(`[transient-retry] upstream ${resp.status}, short backoff, switching account`);
+      }
+      await sleep(1000 + Math.floor(Math.random() * 1000));
+      continue;
+    }
+
     // Normal response (200)
     if (resp.ok) {
       if (isStream) return resp; // streaming: forward directly
@@ -611,8 +639,8 @@ async function handleChat(request, env) {
   const isStream = !!params.stream;
   const sessionId = "sess_" + Date.now();
   const modelConfig = resolveModel(params.model) || MODELS.find((m) => m.id === DEFAULT_MODEL);
-  const model = modelConfig.id;
-  const upstreamModel = modelConfig.upstream;
+  let model = modelConfig.id;
+  let upstreamModel = modelConfig.upstream;
 
   // Build the upstream body (external model IDs kept separate from Cline upstream IDs)
   const body = {
@@ -625,7 +653,7 @@ async function handleChat(request, env) {
   // ⚠️ Free channels (deepseek, stealth, z-ai, cline-free): non-streaming requests get rate-limited upstream (500 empty response content)
   //    while streaming works. So when the client asks for non-streaming, force stream toward
   //    upstream and aggregate the chunks back into a non-streaming response.
-  const forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
+  let forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
   if (isStream || forceStream) body.stream = true;
   // Pass through optional parameters
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
@@ -633,14 +661,31 @@ async function handleChat(request, env) {
   }
 
   try {
-    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    let resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    let fallbackUsed = null;
+    if (!resp.ok && upstreamModel !== "deepseek/deepseek-v4-flash") {
+      // BIG-PROJECT SAFETY NET: prompt exceeds this model's context window →
+      // retry the SAME request once on the 1M-context model instead of failing.
+      let peek = "";
+      try { peek = await resp.clone().text(); } catch (e) {}
+      if (isContextOverflow(peek)) {
+        fallbackUsed = "deepseek/deepseek-v4-flash";
+        model = fallbackUsed;
+        upstreamModel = fallbackUsed;
+        body.model = fallbackUsed;
+        body.stream = true;
+        forceStream = !isStream;
+        console.log(`[context-fallback] ${params.model} overflowed context, retrying on ${fallbackUsed}`);
+        resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+      }
+    }
     if (!resp.ok) {
       const errText = await resp.text();
       return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
     }
     if (isStream) {
       // Client wants streaming: pass the SSE through directly
-      return streamResponse(resp, model, { "X-Cline-Account": servingAccountLabel(env) });
+      return streamResponse(resp, model, acctHeaders(env, fallbackUsed));
     }
     if (forceStream) {
       // Client wants non-streaming + upstream is streaming: aggregate chunks and return
@@ -649,13 +694,13 @@ async function handleChat(request, env) {
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
       retried.data.model = model;
-      return jsonResponse(retried.data, 200, { "X-Cline-Account": servingAccountLabel(env) });
+      return jsonResponse(retried.data, 200, acctHeaders(env, fallbackUsed));
     }
     // Non-streaming + non-deepseek: original logic
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     normalized.model = model;
-    return jsonResponse(normalized, 200, { "X-Cline-Account": servingAccountLabel(env) });
+    return jsonResponse(normalized, 200, acctHeaders(env, fallbackUsed));
   } catch (e) {
     return jsonResponse({ error: { message: e.message, type: "api_error" } }, 500);
   }
@@ -805,8 +850,8 @@ async function handleAnthropic(request, env) {
   const isStream = !!req.stream;
   const sessionId = "sess_" + Date.now();
   const modelConfig = resolveModel(req.model) || MODELS.find((m) => m.id === DEFAULT_MODEL);
-  const requestedModel = modelConfig.id;
-  const upstreamModel = modelConfig.upstream;
+  let requestedModel = modelConfig.id;
+  let upstreamModel = modelConfig.upstream;
 
   // Anthropic → OpenAI message conversion
   const messages = [];
@@ -827,7 +872,7 @@ async function handleAnthropic(request, env) {
     messages,
   };
   // ⚠️ Free channels (deepseek, stealth, z-ai, cline-free): non-streaming is rate-limited upstream, force stream and aggregate
-  const forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
+  let forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
   if (isStream || forceStream) body.stream = true;
   if (req.temperature !== undefined) body.temperature = req.temperature;
   if (req.top_p !== undefined) body.top_p = req.top_p;
@@ -839,26 +884,42 @@ async function handleAnthropic(request, env) {
   }
 
   try {
-    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    let resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    let fallbackUsed = null;
+    if (!resp.ok && upstreamModel !== "deepseek/deepseek-v4-flash") {
+      // BIG-PROJECT SAFETY NET: context overflow → retry once on the 1M-context model
+      let peek = "";
+      try { peek = await resp.clone().text(); } catch (e) {}
+      if (isContextOverflow(peek)) {
+        fallbackUsed = "deepseek/deepseek-v4-flash";
+        requestedModel = fallbackUsed;
+        upstreamModel = fallbackUsed;
+        body.model = fallbackUsed;
+        body.stream = true;
+        forceStream = !isStream;
+        console.log(`[context-fallback] ${req.model} overflowed context, retrying on ${fallbackUsed}`);
+        resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+      }
+    }
     if (!resp.ok) {
       const errText = await resp.text();
       return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
     }
     if (isStream) {
       // Upstream is OpenAI SSE; convert to Anthropic SSE format
-      return streamResponseAnthropic(resp, { "X-Cline-Account": servingAccountLabel(env) });
+      return streamResponseAnthropic(resp, acctHeaders(env, fallbackUsed));
     }
     if (forceStream) {
       // Client wants non-streaming + upstream is streaming: aggregate then convert to Anthropic
       // ⚠️ Same content check applies: the free channel occasionally returns a "200 but content empty" stream; retry on another account if empty
       const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
       if (retried.error) return retried.error;
-      return jsonResponse(openAItoAnthropic(retried.data), 200, { "X-Cline-Account": servingAccountLabel(env) });
+      return jsonResponse(openAItoAnthropic(retried.data), 200, acctHeaders(env, fallbackUsed));
     }
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     // OpenAI → Anthropic
-    return jsonResponse(openAItoAnthropic(normalized), 200, { "X-Cline-Account": servingAccountLabel(env) });
+    return jsonResponse(openAItoAnthropic(normalized), 200, acctHeaders(env, fallbackUsed));
   } catch (e) {
     return jsonResponse({ error: { message: e.message, type: "api_error" } }, 500);
   }
