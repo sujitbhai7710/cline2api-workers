@@ -46,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.1.10";
+const VERSION = "1.2.1";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -113,6 +113,43 @@ export default {
         authenticated: !!(env.API_KEY),
         accounts: poolN,
         model: DEFAULT_MODEL,
+      }, 200);
+    }
+
+    // Per-account quota/usage tracking (requires API key). Shows which accounts are
+    // cooling with their daily-reset countdown, plus lifetime counters. No tokens exposed.
+    if (request.method === "GET" && url.pathname === "/v1/accounts") {
+      const key = getApiKey(request, env);
+      if (!key) {
+        return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+      }
+      const pool = parseAccounts(env);
+      await dbEnsure(env, pool.length);
+      const rows = (await dbRows(env)) || [];
+      const now = Date.now();
+      const list = pool.map((_, i) => {
+        const r = rows.find((x) => x.idx === i) || {};
+        // Cooldown is the daily-quota reset countdown: eligible again once it passes
+        const until = Math.max(r.cooldown_until || 0, pool[i].cooldownUntil || 0);
+        const cooling = until > now;
+        return {
+          account: `${i + 1}/${pool.length}`,
+          status: cooling ? "cooling" : "ok",
+          reset_in_seconds: cooling ? Math.ceil((until - now) / 1000) : 0,
+          total_requests: r.total_requests || 0,
+          total_429s: r.total_429s || 0,
+          total_errors: r.total_errors || 0,
+          last_used_at: r.last_used_at || 0,
+          last_error: r.last_error || "",
+        };
+      });
+      return jsonResponse({
+        ok: true,
+        time: now,
+        persistent: !!(env.DB),
+        db_last_error: dbLastError,
+        eligible: list.filter((a) => a.status === "ok").length,
+        accounts: list,
       }, 200);
     }
 
@@ -219,18 +256,17 @@ async function getAccessToken(env) {
   if (pool.length === 0) {
     throw new Error("Missing CLINE_REFRESH_TOKEN environment variable");
   }
-  // Rotate the starting account on EVERY request so consecutive requests spread
-  // across the whole pool (even quota burn → no single account hits the daily limit first).
-  const start = accountIndex % pool.length;
-  accountIndex = (accountIndex + 1) % pool.length;
-  // Try at most pool.length accounts, beginning at the rotated position
-  // (skipping cooling/refresh-failed ones)
-  for (let attempt = 0; attempt < pool.length; attempt++) {
-    const acc = pool[(start + attempt) % pool.length]; // rotate + walk forward
+  await dbEnsure(env, pool.length);
+  // D1-aware order: eligible + least-recently-used first (plain rotation without D1)
+  const order = await orderIndices(env, pool);
+  for (const i of order) {
+    const acc = pool[i];
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
-      return await getAccountToken(acc);
+      const tok = await getAccountToken(acc);
+      await dbMarkUsed(env, i);
+      return tok;
     } catch (e) {
       if (e.message === "account_cooldown") continue;
       continue; // refresh failed too: move to the next account
@@ -245,6 +281,110 @@ async function getAccessToken(env) {
   } catch (e) {
     throw new Error("All accounts failed to refresh tokens");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent account state (Cloudflare D1) — survives isolates/restarts and is
+// shared across all requests. Tracks per-account quota cooldowns (daily reset
+// countdowns), usage counters and errors. Every function below is a safe no-op
+// when no D1 binding exists (env.DB undefined), falling back to in-memory only.
+// ---------------------------------------------------------------------------
+
+let dbCache = { at: 0, rows: null };
+const DB_CACHE_TTL_MS = 30000; // short read cache; invalidated on every write
+let dbLastError = ""; // last D1 failure reason (surfaced via /v1/accounts for debugging)
+
+function dbNoteError(e) {
+  dbLastError = String((e && e.message) || e || "unknown").slice(0, 200);
+}
+
+function dbInvalidate() {
+  dbCache = { at: 0, rows: null };
+}
+
+// Read all account rows (cached briefly). Returns null when D1 is unavailable.
+async function dbRows(env) {
+  if (!env.DB) return null;
+  const now = Date.now();
+  if (dbCache.rows && now - dbCache.at < DB_CACHE_TTL_MS) return dbCache.rows;
+  try {
+    const res = await env.DB.prepare("SELECT * FROM accounts").all();
+    dbCache = { at: now, rows: res.results || [] };
+    return dbCache.rows;
+  } catch (e) {
+    dbNoteError(e);
+    return null; // table missing etc: degrade to in-memory
+  }
+}
+
+// Make sure a row exists for every pool position (new accounts appear automatically).
+// Skips the write entirely when cached rows already cover the pool (saves D1 quota).
+async function dbEnsure(env, n) {
+  if (!env.DB) return;
+  try {
+    const rows = await dbRows(env);
+    if (rows && rows.length >= n) return; // nothing to do
+    await env.DB.batch(
+      Array.from({ length: n }, (_, i) =>
+        env.DB.prepare("INSERT OR IGNORE INTO accounts (idx) VALUES (?)").bind(i)
+      )
+    );
+    dbInvalidate();
+  } catch (e) {
+    dbNoteError(e);
+  }
+}
+
+// Record a served request (drives least-recently-used ordering)
+async function dbMarkUsed(env, idx) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE accounts SET last_used_at = ?, total_requests = total_requests + 1 WHERE idx = ?"
+    ).bind(Date.now(), idx).run();
+    dbInvalidate();
+  } catch (e) {
+    dbNoteError(e);
+  }
+}
+
+// Persist a cooldown + bump counters. kind: "rate" (429/quota) or "error" (empty/failed).
+async function dbMarkCooldown(env, idx, untilMs, kind, detail) {
+  if (!env.DB) return;
+  try {
+    const col = kind === "rate" ? "total_429s" : "total_errors";
+    await env.DB.prepare(
+      `UPDATE accounts SET cooldown_until = ?, ${col} = ${col} + 1, last_error = ? WHERE idx = ?`
+    ).bind(untilMs, String(detail || kind).slice(0, 200), idx).run();
+    dbInvalidate();
+  } catch (e) {
+    dbNoteError(e);
+  }
+}
+
+// Pool indices ordered for the next request: quota-eligible first (cooldown expired
+// = daily quota reset → usable again), then least-recently-used for even burn.
+// Without D1, falls back to the in-memory round-robin cursor.
+async function orderIndices(env, pool) {
+  const rows = await dbRows(env);
+  if (!rows) {
+    const start = accountIndex % pool.length;
+    accountIndex = (accountIndex + 1) % pool.length;
+    return Array.from({ length: pool.length }, (_, k) => (start + k) % pool.length);
+  }
+  const byIdx = new Map(rows.map((r) => [r.idx, r]));
+  const now = Date.now();
+  return pool.map((_, i) => i).sort((a, b) => {
+    const ra = byIdx.get(a);
+    const rb = byIdx.get(b);
+    const ca = ra && ra.cooldown_until > now ? 1 : 0;
+    const cb = rb && rb.cooldown_until > now ? 1 : 0;
+    if (ca !== cb) return ca - cb; // eligible (quota reset / never limited) first
+    const la = ra ? ra.last_used_at : 0;
+    const lb = rb ? rb.last_used_at : 0;
+    if (la !== lb) return la - lb; // least-recently-used first
+    return a - b;
+  });
 }
 
 // Which pool position served the current request, e.g. "3/7" (for the X-Cline-Account debug header)
@@ -368,6 +508,10 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         currentAccount.cooldownUntil = Date.now() + cooldownMs;
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
+        // Persist the quota cooldown (daily-reset countdown) so ALL isolates skip this account until reset
+        const pool = parseAccounts(env);
+        await dbMarkCooldown(env, pool.indexOf(currentAccount), Date.now() + cooldownMs, "rate",
+          `429/quota, resets in ${Math.round(cooldownMs / 1000)}s`);
         console.log(`[account-switch] account quota/rate-limited, cooling down ${Math.round(cooldownMs / 1000)}s, switching to the next one`);
       }
       // Other accounts still available → short backoff then retry (switches to the next account)
@@ -509,6 +653,8 @@ async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstRes
         currentAccount.cooldownUntil = Date.now() + 30 * 1000; // short 30s cooldown
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
+        const pool = parseAccounts(env);
+        await dbMarkCooldown(env, pool.indexOf(currentAccount), Date.now() + 30 * 1000, "error", "empty content");
         console.log(`[empty-content] account ${attempt} returned empty content, cooling down 30s, retry #${attempt + 2}`);
       }
       await sleep(300 + Math.floor(Math.random() * 300));

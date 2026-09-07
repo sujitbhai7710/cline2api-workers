@@ -4,3 +4,12 @@ compatibility_date = "2026-01-01"
 
 # After deployment: https://cline2api.<your-subdomain>.workers.dev
 # Note: CLINE_REFRESH_TOKEN must be set via `wrangler secret`, do not put it here!
+
+# Persistent per-account quota tracking (optional but recommended).
+# Create once: wrangler d1 create cline2api-state
+# Then create the table: wrangler d1 execute cline2api-state --remote --command "CREATE TABLE IF NOT EXISTS accounts (idx INTEGER PRIMARY KEY, cooldown_until INTEGER NOT NULL DEFAULT 0, total_requests INTEGER NOT NULL DEFAULT 0, total_429s INTEGER NOT NULL DEFAULT 0, total_errors INTEGER NOT NULL DEFAULT 0, last_used_at INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '')"
+# Then fill in your database_id below (wrangler d1 list).
+[[d1_databases]]
+binding = "DB"
+database_name = "cline2api-state"
+database_id = "4d2a8702-1061-454c-ae46-0bc3f1953f96"
