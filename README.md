@@ -210,11 +210,15 @@ Compatible with OpenAI clients (`/v1/chat/completions`) and Anthropic clients (`
 
 ### Available models (tested)
 
+`GET /v1/models` mirrors **Cline's live catalog** (free + cline-pass + recommended, currently ~26 IDs) with a 1-hour cache, so clients with auto-detect (Cline extension, OpenCode, Hermes…) always see everything Cline offers — including models added after this release. Any model ID a client sends is forwarded as-is (common shorthand spellings are auto-normalized); only upstream decides validity.
+
 | Model ID | Result |
 |---|---|
 | `deepseek/deepseek-v4-flash` | ✅ **Free, working** (default; requires full Cline client headers + forced streaming, fixed) |
 | `depth/deepseek-v4-flash` | ✅ **Free, working** (spelling alias of `deepseek/deepseek-v4-flash`, same model, any prefix works) |
 | `stealth/ox-alpha` | ✅ **Free, working** ("Ox Alpha" stealth preview model on Cline's free tier; 1M context, limited-time early free access — added 2026-08-25) |
+| `z-ai/glm-5.3-flash` | ✅ **Free, working** (latest free GLM multimodal, added 2026-08-25) |
+| `cline-free/longcat-2.0` | ✅ **Free, working** (tested end-to-end 2026-09-07) |
 | `poolside/laguna-s-2.1:free` | ✅ **Free, working** |
 | `zai/glm-5.2` | ✅ **Working (paid)**, uses Cline system credentials, ~$0.0008/request |
 | `cline-free/glm-5.2` | ❌ **Delisted** (upstream 404 `model not found`, tested 2026-08-06) |

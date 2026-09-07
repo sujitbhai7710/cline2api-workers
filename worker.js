@@ -46,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -65,10 +65,13 @@ const MODEL_ALIASES = {
 };
 
 // Resolve a client-supplied model name into a MODELS entry.
-// Order: exact ID → alias table → slug match (ignores prefix/suffix/case/spelling of "0x")
-// → passthrough for well-formed "provider/model" strings → null (caller falls back to default).
+// Order: exact ID → alias table → slug match (ignores prefix/suffix/case/spelling of "0x").
+// NOT STRICT: anything else is forwarded verbatim and upstream decides
+// (only an empty model falls back to the default).
 function resolveModel(raw) {
   const input = String(raw || "").trim();
+  if (!input) return null;
+
   const byId = MODELS.find((m) => m.id === input);
   if (byId) return byId;
 
@@ -77,19 +80,14 @@ function resolveModel(raw) {
 
   const aliased = MODEL_ALIASES[canon(input)];
   if (aliased) {
-    return MODELS.find((m) => m.id === aliased) || null;
+    return MODELS.find((m) => m.id === aliased) || { id: aliased, upstream: aliased };
   }
 
   const slug = canon(input.split("/").pop());
   const matched = MODELS.find((m) => canon(m.upstream.split("/").pop()) === slug);
   if (matched) return matched;
 
-  if (input.includes("/") && input.split("/").every((p) => p.trim().length > 0)) {
-    // Well-formed provider/model string we don't know: forward as-is and let upstream decide
-    return { id: input, upstream: input };
-  }
-  // Malformed (no slash, unknown name): fall back to the default model instead of a 400
-  return null;
+  return { id: input, upstream: input }; // unknown: forward as-is, upstream decides
 }
 
 export default {
@@ -624,10 +622,10 @@ async function handleChat(request, env) {
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
     messages: params.messages || [],
   };
-  // ⚠️ Free channels (deepseek, stealth, z-ai): non-streaming requests get rate-limited upstream (500 empty response content)
+  // ⚠️ Free channels (deepseek, stealth, z-ai, cline-free): non-streaming requests get rate-limited upstream (500 empty response content)
   //    while streaming works. So when the client asks for non-streaming, force stream toward
   //    upstream and aggregate the chunks back into a non-streaming response.
-  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/") || upstreamModel.startsWith("z-ai/"));
+  const forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
   if (isStream || forceStream) body.stream = true;
   // Pass through optional parameters
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
@@ -828,8 +826,8 @@ async function handleAnthropic(request, env) {
     reasoning_effort: "high",
     messages,
   };
-  // ⚠️ Free channels (deepseek, stealth, z-ai): non-streaming is rate-limited upstream, force stream and aggregate
-  const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("stealth/") || upstreamModel.startsWith("z-ai/"));
+  // ⚠️ Free channels (deepseek, stealth, z-ai, cline-free): non-streaming is rate-limited upstream, force stream and aggregate
+  const forceStream = !isStream && /^(deepseek|stealth|z-ai|cline-free)\//.test(upstreamModel);
   if (isStream || forceStream) body.stream = true;
   if (req.temperature !== undefined) body.temperature = req.temperature;
   if (req.top_p !== undefined) body.top_p = req.top_p;
@@ -1021,11 +1019,52 @@ function openAItoAnthropic(openAI) {
 // ---------------------------------------------------------------------------
 
 function handleModels() {
+  return handleModelsAsync().catch(() => handleModelsStatic());
+}
+
+// Static fallback: our known IDs (used when the upstream catalog fetch fails)
+function handleModelsStatic() {
   const list = MODELS.map((m) => ({
     id: m.id,
     object: "model",
     created: Math.floor(Date.now() / 1000),
     owned_by: "cline",
+  }));
+  return jsonResponse({ object: "list", data: list }, 200, { "X-Cline2api-Version": VERSION });
+}
+
+// Live Cline catalog (public endpoint, no account quota spent), cached 1 hour.
+// Merges free + clinePass + recommended (+ clineCloud) groups so clients that
+// auto-detect (Cline extension, OpenCode, Hermes…) see everything Cline offers.
+let modelsCache = { at: 0, list: null };
+const MODELS_CACHE_TTL_MS = 60 * 60 * 1000;
+
+async function handleModelsAsync() {
+  const now = Date.now();
+  if (!modelsCache.list || now - modelsCache.at >= MODELS_CACHE_TTL_MS) {
+    const resp = await fetch("https://api.cline.bot/api/v1/ai/cline/recommended-models");
+    if (!resp.ok) throw new Error("upstream " + resp.status);
+    const data = await resp.json();
+    const seen = new Set();
+    const list = [];
+    const push = (id) => {
+      id = String(id || "").trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      list.push(id);
+    };
+    for (const group of [data?.free, data?.clinePass, data?.recommended, data?.clineCloud]) {
+      if (Array.isArray(group)) for (const m of group) push(m && m.id);
+    }
+    for (const m of MODELS) push(m.id); // keep our known IDs even if upstream drops them
+    if (list.length === 0) throw new Error("empty upstream list");
+    modelsCache = { at: now, list };
+  }
+  const list = modelsCache.list.map((id) => ({
+    id,
+    object: "model",
+    created: Math.floor(Date.now() / 1000),
+    owned_by: id.includes("/") ? id.split("/")[0] : "cline",
   }));
   return jsonResponse({ object: "list", data: list }, 200, { "X-Cline2api-Version": VERSION });
 }
