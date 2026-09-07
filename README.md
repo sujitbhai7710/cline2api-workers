@@ -120,11 +120,12 @@ third-account-refreshToken
 ```
 
 **How it works:**
-- 🔄 **Account pool rotation**: every request starts from the next account in the pool (round-robin cursor), so quota burns evenly across accounts instead of hammering #1 until it 429s. Cooling/failed accounts are skipped automatically.
-- ⚡ **Quota exhaustion / rate limit auto-switch**: if an account hits a 429 (`Daily free limit reached`) or an empty response,
-  the worker **parses the upstream cooldown hint** (e.g. `Try again in 2h 51m`), cools that account down for exactly that duration and switches to the next one, retrying the same request
-- 🗄️ **Persistent tracking (Cloudflare D1)**: per-account cooldowns (= daily-reset countdowns), request/429/error counters and last-used timestamps live in a shared D1 table, so state survives restarts and is shared across all worker instances. Request routing prefers eligible + least-recently-used accounts. Works without D1 too (in-memory fallback).
-- 🔍 **Verifiable**: every successful response carries an `X-Cline-Account` header (e.g. `3/7`) showing which pool position served it.
+- 🔄 **Account pool rotation**: every request starts from the next account in the pool (in-memory round-robin cursor), so quota burns evenly across accounts instead of hammering #1 until it 429s. The hot path makes **zero database calls** — requests never wait on D1.
+- ⚡ **One key fails → next key automatically**: if an account hits a 429 (`Daily free limit reached`), an empty response or a 5xx, the same request is instantly retried on the next account (with short backoff). All-accounts-cooling returns the upstream response as-is instead of spinning.
+- 💾 **Reset time saved on failure only**: when a key fails with a quota error, the worker parses the upstream reset countdown (e.g. `Try again in 2h 51m`) and saves that account's reset timestamp to D1. No D1 writes happen on successful requests.
+- ⏰ **5-minute quota checker (cron)**: every 5 minutes the worker re-probes (tiny 1-token call) only the accounts whose recorded reset time is due — still-limited ones get a fresh countdown, restored ones are cleared so traffic flows back to them automatically.
+- 🗄️ **D1 = failure + cron state only**: cooldowns (= daily-reset countdowns), 429/error counters and last errors live in the shared `cline2api-state` D1 table, surviving restarts. Everything degrades gracefully to in-memory if D1 is unreachable.
+- 🔍 **Verifiable**: every successful response carries an `X-Cline-Account` header (e.g. `3/20`) showing which pool position served it.
   `GET /v1/accounts` (API-key required) returns the full live table: per-account `status` (`ok`/`cooling`), `reset_in_seconds`, counters and last errors — no tokens exposed.
 - 🚫 **Dead accounts are skipped automatically**: failed refreshes don't block anything
 - ✅ **Independent caches**: each account's accessToken is cached independently

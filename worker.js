@@ -46,7 +46,7 @@ const MODELS = [
 
 // Default model: Cline's free DeepSeek channel (full headers + forced streaming, fixed)
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 
 // Loose spellings clients commonly send, mapped to canonical model IDs
 const MODEL_ALIASES = {
@@ -177,6 +177,31 @@ export default {
 
     return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
   },
+
+  // Quota checker (cron, every 5 min — see [triggers] in wrangler.toml).
+  // Re-verifies accounts whose recorded reset time is due: still-limited accounts
+  // get a fresh countdown, restored ones are cleared so requests flow to them again.
+  // This + failure-triggered saves are the ONLY D1 users; normal requests never touch D1.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      try {
+        const pool = parseAccounts(env);
+        if (pool.length === 0 || !env.DB) return;
+        await dbEnsure(env, pool.length);
+        const rows = await dbRows(env);
+        if (!rows) return;
+        const now = Date.now();
+        for (const r of rows) {
+          const until = r.cooldown_until || 0;
+          // Probe only accounts with a recorded reset that is due (or overdue)
+          if (until > 0 && until - now <= 5 * 60 * 1000) {
+            await probeAccountQuota(env, r.idx);
+            await sleep(1000); // gentle pacing between probes
+          }
+        }
+      } catch (e) {}
+    })());
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -256,17 +281,18 @@ async function getAccessToken(env) {
   if (pool.length === 0) {
     throw new Error("Missing CLINE_REFRESH_TOKEN environment variable");
   }
-  await dbEnsure(env, pool.length);
-  // D1-aware order: eligible + least-recently-used first (plain rotation without D1)
-  const order = await orderIndices(env, pool);
-  for (const i of order) {
-    const acc = pool[i];
+  // HOT PATH = ZERO D1. Pure in-memory rotation only. D1 is touched exclusively
+  // on failures (persist reset time) and by the 5-minute quota-checker cron —
+  // normal requests never wait on the database.
+  // Rotate the starting account on EVERY request for even quota burn.
+  const start = accountIndex % pool.length;
+  accountIndex = (accountIndex + 1) % pool.length;
+  for (let attempt = 0; attempt < pool.length; attempt++) {
+    const acc = pool[(start + attempt) % pool.length]; // rotate + walk forward
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
-      const tok = await getAccountToken(acc);
-      await dbMarkUsed(env, i);
-      return tok;
+      return await getAccountToken(acc);
     } catch (e) {
       if (e.message === "account_cooldown") continue;
       continue; // refresh failed too: move to the next account
@@ -335,19 +361,6 @@ async function dbEnsure(env, n) {
   }
 }
 
-// Record a served request (drives least-recently-used ordering)
-async function dbMarkUsed(env, idx) {
-  if (!env.DB) return;
-  try {
-    await env.DB.prepare(
-      "UPDATE accounts SET last_used_at = ?, total_requests = total_requests + 1 WHERE idx = ?"
-    ).bind(Date.now(), idx).run();
-    dbInvalidate();
-  } catch (e) {
-    dbNoteError(e);
-  }
-}
-
 // Persist a cooldown + bump counters. kind: "rate" (429/quota) or "error" (empty/failed).
 async function dbMarkCooldown(env, idx, untilMs, kind, detail) {
   if (!env.DB) return;
@@ -362,29 +375,17 @@ async function dbMarkCooldown(env, idx, untilMs, kind, detail) {
   }
 }
 
-// Pool indices ordered for the next request: quota-eligible first (cooldown expired
-// = daily quota reset → usable again), then least-recently-used for even burn.
-// Without D1, falls back to the in-memory round-robin cursor.
-async function orderIndices(env, pool) {
-  const rows = await dbRows(env);
-  if (!rows) {
-    const start = accountIndex % pool.length;
-    accountIndex = (accountIndex + 1) % pool.length;
-    return Array.from({ length: pool.length }, (_, k) => (start + k) % pool.length);
+// Clear a cooldown after the quota-reset probe succeeds (account usable again)
+async function dbClearCooldown(env, idx) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE accounts SET cooldown_until = 0, last_error = 'quota restored (cron probe)' WHERE idx = ?"
+    ).bind(idx).run();
+    dbInvalidate();
+  } catch (e) {
+    dbNoteError(e);
   }
-  const byIdx = new Map(rows.map((r) => [r.idx, r]));
-  const now = Date.now();
-  return pool.map((_, i) => i).sort((a, b) => {
-    const ra = byIdx.get(a);
-    const rb = byIdx.get(b);
-    const ca = ra && ra.cooldown_until > now ? 1 : 0;
-    const cb = rb && rb.cooldown_until > now ? 1 : 0;
-    if (ca !== cb) return ca - cb; // eligible (quota reset / never limited) first
-    const la = ra ? ra.last_used_at : 0;
-    const lb = rb ? rb.last_used_at : 0;
-    if (la !== lb) return la - lb; // least-recently-used first
-    return a - b;
-  });
 }
 
 // Which pool position served the current request, e.g. "3/7" (for the X-Cline-Account debug header)
@@ -437,6 +438,59 @@ async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
     return clineFetch(env, path, bodyObj, sessionId, true);
   }
   return resp;
+}
+
+// Probe one account's live quota with a minimal 1-token request (5-minute cron only,
+// never on the request path). 429 → still exhausted: persist the fresh reset time.
+// 2xx → quota restored: clear the cooldown so traffic flows to it again.
+// Anything else → leave state untouched for the next check.
+async function probeAccountQuota(env, poolIdx) {
+  const pool = parseAccounts(env);
+  const acc = pool[poolIdx];
+  if (!acc) return;
+  currentAccount = acc;
+  let token;
+  try {
+    token = await getAccountToken(acc);
+  } catch (e) {
+    const until = Date.now() + 5 * 60 * 1000;
+    acc.cooldownUntil = until;
+    await dbMarkCooldown(env, poolIdx, until, "error", "cron probe: refresh failed");
+    return;
+  }
+  currentToken = token;
+  const headers = clineHeaders("cron-probe");
+  headers.Authorization = "Bearer workos:" + token;
+  let resp;
+  try {
+    resp = await fetch(CLINE_API_BASE + "/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: DEFAULT_MODEL,
+        max_tokens: 1,
+        session_id: "cron-probe",
+        stream: true,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+    });
+  } catch (e) {
+    return; // network blip: leave state as-is, retry next cron
+  }
+  if (resp.status === 429) {
+    const text = await resp.text().catch(() => "");
+    const ms = parseCooldown(text, resp.status);
+    acc.cooldownUntil = Date.now() + ms;
+    await dbMarkCooldown(env, poolIdx, Date.now() + ms, "rate",
+      `cron probe: still limited, resets in ${Math.round(ms / 1000)}s`);
+    return;
+  }
+  try { await resp.body.cancel(); } catch (e) {}
+  if (resp.ok) {
+    acc.cooldownUntil = 0;
+    await dbClearCooldown(env, poolIdx);
+  }
+  // Other statuses (400/403/5xx): leave state untouched, retry next cron
 }
 
 // ---------------------------------------------------------------------------

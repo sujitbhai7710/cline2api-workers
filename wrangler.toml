@@ -13,3 +13,7 @@ compatibility_date = "2026-01-01"
 binding = "DB"
 database_name = "cline2api-state"
 database_id = "4d2a8702-1061-454c-ae46-0bc3f1953f96"
+
+# Quota checker: re-verifies accounts whose recorded daily-reset time is due, every 5 min
+[triggers]
+crons = ["*/5 * * * *"]
